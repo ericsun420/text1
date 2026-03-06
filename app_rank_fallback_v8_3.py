@@ -3,7 +3,6 @@ import io
 import math
 import re
 import time
-import copy
 from datetime import datetime, timedelta, time as dtime
 from collections import deque
 
@@ -31,6 +30,8 @@ RANK_SOURCES = [
     {"name": "HiStock 即時成交量排行", "url": "https://histock.tw/stock/rank.aspx?d=1&m=11&t=dt", "kind": "histock"},
     {"name": "WantGoo 成交量排行", "url": "https://www.wantgoo.com/stock/ranking/volume", "kind": "wantgoo"},
 ]
+
+RANK_CACHE_TTL = 12
 
 
 def diag_init():
@@ -80,14 +81,21 @@ RANK_UA = (
 )
 
 
-def get_rank_headers():
+def get_rank_headers(url: str = ""):
+    referer = "https://www.google.com/"
+    if "yahoo.com" in url:
+        referer = "https://tw.stock.yahoo.com/"
+    elif "histock.tw" in url:
+        referer = "https://histock.tw/"
+    elif "wantgoo.com" in url:
+        referer = "https://www.wantgoo.com/stock"
     return {
         "User-Agent": RANK_UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
-        "Referer": "https://www.wantgoo.com/stock",
+        "Referer": referer,
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
     }
@@ -288,7 +296,8 @@ def _parse_yahoo_table(html: str):
 
     m = re.search(r"資料時間[:：]?\s*(\d{4}/\d{2}/\d{2}(?:\s+\d{2}:\d{2})?)", html)
     asof = m.group(1) if m else ""
-    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots"]].reset_index(drop=True), asof
+    out["prev_close"] = math.nan
+    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close"]].reset_index(drop=True), asof
 
 
 def _parse_histock_table(html: str):
@@ -356,7 +365,7 @@ def _parse_histock_table(html: str):
         asof = f"{date_m.group(1)} {time_m.group(1)}"
     elif time_m:
         asof = time_m.group(1)
-    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots"]].reset_index(drop=True), asof
+    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close"]].reset_index(drop=True), asof
 
 
 def _parse_wantgoo_table(html: str):
@@ -392,18 +401,19 @@ def _parse_wantgoo_table(html: str):
 
     m = re.search(r"(\d{4}/\d{2}/\d{2})", html)
     asof = m.group(1) if m else ""
-    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots"]].reset_index(drop=True), asof
+    out["prev_close"] = math.nan
+    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close"]].reset_index(drop=True), asof
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=RANK_CACHE_TTL, show_spinner=False)
 def _fetch_rank_html(url: str):
-    session = make_retry_session(base_headers=get_rank_headers())
+    session = make_retry_session(base_headers=get_rank_headers(url))
     r = safe_get(session, url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.text
 
 
-@st.cache_data(ttl=20, show_spinner=False)
+@st.cache_data(ttl=RANK_CACHE_TTL, show_spinner=False)
 def fetch_rank_candidates(max_rows: int = 250):
     errors = []
     for spec in RANK_SOURCES:
@@ -538,7 +548,8 @@ def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
             chg = float(q["chg"]) if pd.notna(q["chg"]) else 0.0
             chg_pct = float(q["chg_pct"]) if pd.notna(q["chg_pct"]) else 0.0
 
-            prev_close = round(last - chg, 2)
+            prev_from_src = float(q["prev_close"]) if ("prev_close" in q and pd.notna(q["prev_close"])) else math.nan
+            prev_close = prev_from_src if math.isfinite(prev_from_src) and prev_from_src > 0 else round(last - chg, 2)
             if prev_close <= 0:
                 diag["rank_parse_fail"] += 1
                 continue
@@ -651,7 +662,8 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
                 else:
                     status = "⚡ 發動"
 
-                vol_score = max(0.1, min(99.9, r["vol_sh"] / 1000.0 / 1000.0))
+                base_lots = 200.0 if is_test else 3000.0
+                vol_score = max(0.1, min(99.9, (r["vol_sh"] / 1000.0) / base_lots))
                 results.append({
                     "代號": c,
                     "名稱": name,
@@ -857,14 +869,15 @@ st.markdown('<div class="status-caption">排行候選池 v8.5｜切換即時套�
 
 if not HAS_YF:
     st.warning('⚠️ 目前環境未安裝 yfinance，系統已自動切換成「排行即時候選模式」。若要恢復血統/20日量均濾網，請在 requirements.txt 加入 yfinance。')
+    st.caption('🛡️ 連板血統在無 yfinance 模式下不生效，因此已自動停用。')
 
 col_cfg = st.columns([1.2, 1.2, 1])
 with col_cfg[0]:
     is_test = st.toggle("🔥 寬鬆測試模式", value=False)
 with col_cfg[1]:
-    use_bloodline = st.toggle("🛡️ 嚴格連板血統", value=True)
+    use_bloodline = st.toggle("🛡️ 嚴格連板血統", value=True, disabled=not HAS_YF)
 with col_cfg[2]:
-    st.caption("切換模式會直接套用上次快取，不重新掃描")
+    st.caption("切換模式會直接套用上次快取，不重新掃描；重新掃描會抓最新網站資料")
 
 now_time = time.time()
 last_run = st.session_state.get("last_run_ts", 0)

@@ -1,4 +1,5 @@
 # app.py — 起漲戰情室｜戰神 v8.7 官方API優先版｜多來源備援｜即時切換｜訊號校準
+import html
 import io
 import math
 import re
@@ -1070,6 +1071,91 @@ def recompute_from_snapshot(snapshot, is_test, use_bloodline):
 # =========================
 # SINGLE SEARCH / SCORING
 # =========================
+
+
+def format_rank_table_html(table_df: pd.DataFrame) -> str:
+    if table_df is None or getattr(table_df, "empty", False):
+        return '<div class="rank-table-empty">目前沒有可顯示的資料。</div>'
+
+    df = table_df.copy().reset_index(drop=True)
+    df.insert(0, "#", [i + 1 for i in range(len(df))])
+
+    def fmt_value(col, val):
+        if pd.isna(val):
+            return "—"
+        if col == "現價":
+            try:
+                return f"{float(val):.2f}".rstrip("0").rstrip(".")
+            except Exception:
+                return html.escape(str(val))
+        if col == "爆量":
+            try:
+                return f"{float(val):.2f}x"
+            except Exception:
+                return html.escape(str(val))
+        if col == "漲幅%":
+            try:
+                return f"{float(val):.2f}%"
+            except Exception:
+                return html.escape(str(val))
+        return html.escape(str(val))
+
+    def cell_html(col, val):
+        safe = fmt_value(col, val)
+        if col == "#":
+            return f'<td class="c-rank">{safe}</td>'
+        if col == "代號":
+            return f'<td class="c-code">{safe}</td>'
+        if col == "名稱":
+            return f'<td class="c-name">{safe}</td>'
+        if col == "現價":
+            return f'<td class="c-price">{safe}</td>'
+        if col == "爆量":
+            return f'<td class="c-power">{safe}</td>'
+        if col == "狀態":
+            cls = "is-live"
+            txt = str(val)
+            if "鎖價" in txt or "鎖單" in txt:
+                cls = "is-lock"
+            elif "觀察" in txt or "盤整" in txt:
+                cls = "is-watch"
+            return f'<td><span class="status-pill {cls}">{html.escape(txt)}</span></td>'
+        if col == "階段":
+            return f'<td><span class="stage-pill">{safe}</span></td>'
+        if col == "漲幅%":
+            try:
+                num = float(val)
+            except Exception:
+                num = 0.0
+            tone = "up" if num >= 9.5 else "mid" if num >= 6 else "flat"
+            return f'<td class="c-chg {tone}">{safe}</td>'
+        return f'<td>{safe}</td>'
+
+    headers = ''.join([f'<th>{html.escape(str(c))}</th>' for c in df.columns])
+    rows = []
+    for _, row in df.iterrows():
+        cells = ''.join(cell_html(col, row[col]) for col in df.columns)
+        rows.append(f'<tr>{cells}</tr>')
+    body = ''.join(rows)
+
+    return (
+        '<div class="rank-table-shell">'
+        '<div class="rank-table-toolbar">'
+        '<div>'
+        '<div class="rank-table-title">戰區嚴選名單</div>'
+        '<div class="rank-table-subtitle">深色玻璃表格版｜保留閱讀性與掃描速度</div>'
+        '</div>'
+        f'<div class="rank-table-count">共 {len(df)} 檔</div>'
+        '</div>'
+        '<div class="rank-table-wrap">'
+        '<table class="rank-table">'
+        f'<thead><tr>{headers}</tr></thead>'
+        f'<tbody>{body}</tbody>'
+        '</table>'
+        '</div>'
+        '</div>'
+    )
+
 def _score_badge(score: int) -> str:
     if score >= 9:
         return "S級戰神"
@@ -1511,6 +1597,76 @@ st.markdown(
   border-radius: 10px; margin: 4px; font-size: 12px; border: 1px solid rgba(251,113,133,.16); font-weight: 700;
 }
 .soft-line { height:1px; background: linear-gradient(90deg, transparent, rgba(255,255,255,.11), transparent); margin: 16px 0; }
+
+.rank-table-shell {
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 22px;
+  overflow: hidden;
+  background: linear-gradient(180deg, rgba(10,14,20,.98), rgba(7,10,15,.94));
+  box-shadow: 0 18px 40px rgba(0,0,0,.20);
+}
+.rank-table-toolbar {
+  display:flex; align-items:center; justify-content:space-between; gap:14px;
+  padding: 16px 18px;
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  background: linear-gradient(90deg, rgba(20,28,40,.86), rgba(14,18,26,.66));
+}
+.rank-table-title { color:#f8fbff; font-size:16px; font-weight:900; letter-spacing:.6px; }
+.rank-table-subtitle { color:#8ea0b7; font-size:12px; margin-top:4px; }
+.rank-table-count {
+  color:#dce9f8; font-size:12px; font-weight:800; padding:8px 12px; border-radius:999px;
+  border:1px solid rgba(97,218,251,.14); background: rgba(97,218,251,.08);
+}
+.rank-table-wrap { overflow-x:auto; }
+.rank-table {
+  width:100%; border-collapse:separate; border-spacing:0; min-width: 960px;
+  background: transparent; color:#e8f0f8;
+}
+.rank-table thead th {
+  position: sticky; top: 0; z-index: 1;
+  text-align:left; font-size:12px; font-weight:800; letter-spacing:.7px; color:#90a4bc;
+  padding: 14px 14px; background: rgba(12,18,26,.96); border-bottom:1px solid rgba(255,255,255,.08);
+}
+.rank-table tbody td {
+  padding: 14px 14px; border-bottom:1px solid rgba(255,255,255,.05); font-size:14px;
+  background: linear-gradient(180deg, rgba(10,13,19,.55), rgba(10,13,19,.35));
+}
+.rank-table tbody tr:nth-child(odd) td { background: linear-gradient(180deg, rgba(11,15,22,.72), rgba(11,15,22,.52)); }
+.rank-table tbody tr:hover td {
+  background: linear-gradient(90deg, rgba(21,31,46,.96), rgba(15,20,30,.92));
+}
+.rank-table tbody tr:last-child td { border-bottom: none; }
+.rank-table .c-rank {
+  width: 54px; color:#8ddcff; font-weight:900; font-size:18px;
+}
+.rank-table .c-code { color:#e8f0f8; font-weight:800; letter-spacing:.4px; }
+.rank-table .c-name { color:#f8fbff; font-weight:800; }
+.rank-table .c-price { color:#ffffff; font-weight:900; font-size:16px; }
+.rank-table .c-power { color:#96f7c8; font-weight:800; }
+.rank-table .c-chg { font-weight:900; }
+.rank-table .c-chg.up { color:#ff8fa3; }
+.rank-table .c-chg.mid { color:#ffd479; }
+.rank-table .c-chg.flat { color:#dbe7f5; }
+.status-pill, .stage-pill {
+  display:inline-flex; align-items:center; justify-content:center;
+  padding: 7px 12px; border-radius: 999px; font-size:12px; font-weight:800;
+  border: 1px solid rgba(255,255,255,.08);
+}
+.status-pill.is-live {
+  color:#ffd28b; background: rgba(245,158,11,.10); border-color: rgba(245,158,11,.20);
+}
+.status-pill.is-lock {
+  color:#ffb4cb; background: rgba(244,63,94,.10); border-color: rgba(244,63,94,.20);
+}
+.status-pill.is-watch {
+  color:#d7c2ff; background: rgba(124,58,237,.11); border-color: rgba(124,58,237,.22);
+}
+.stage-pill {
+  color:#97e7ff; background: rgba(97,218,251,.08); border-color: rgba(97,218,251,.18);
+}
+.rank-table-empty {
+  padding:18px; color:#8ea0b7; border:1px dashed rgba(255,255,255,.1); border-radius:16px;
+}
 .stButton>button {
   border-radius: 18px !important;
   background: linear-gradient(135deg, #f8fafc 0%, #cfe2ff 48%, #e2d8ff 100%) !important;
@@ -1795,7 +1951,7 @@ if scan:
                 )
         table_df = res[["代號", "名稱", "現價", "爆量", "狀態", "階段", "漲幅%"]].copy()
         with st.expander("📋 嚴選名單明細表", expanded=False):
-            st.dataframe(table_df, use_container_width=True, hide_index=True)
+            st.markdown(format_rank_table_html(table_df), unsafe_allow_html=True)
     else:
         if d.get("rank_parse_ok", 0) == 0:
             st.error("🚨 本輪未成功取得可用排行快照。請先看白盒面板，確認官方或備援來源是否都失敗。")

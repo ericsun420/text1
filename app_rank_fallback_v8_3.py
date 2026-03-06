@@ -11,7 +11,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
 import pandas as pd
-import yfinance as yf
+try:
+    import yfinance as yf
+    HAS_YF = True
+except Exception:
+    yf = None
+    HAS_YF = False
 import streamlit as st
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -165,7 +170,7 @@ def get_stock_list():
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def yf_download_daily(syms):
-    if not syms:
+    if (not HAS_YF) or (not syms):
         return None
     df = yf.download(
         tickers=" ".join(syms),
@@ -570,6 +575,56 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
     syms = [f"{c}.{'TW' if meta_dict[c]['ex'] == 'tse' else 'TWO'}" for c in candidates_df["code"]]
     yf_diag["yf_symbols"] = len(syms)
 
+    # yfinance 若未安裝，系統降級為「排行即時候選模式」：
+    # 保留排行來源的高/低/漲幅/接近漲停判斷，不做 20 日量均與連板血統。
+    if not HAS_YF:
+        diag_err(diag, Exception("yfinance not installed; fallback to rank-only mode"), "YF_MISSING")
+        diag["t_yf"] = 0.0
+        results = []
+        m = int((datetime.combine(now_ts.date(), now_ts.time()) - datetime.combine(now_ts.date(), dtime(9, 0))).total_seconds() // 60)
+        m = max(0, min(270, m))
+        pb_lim = 0.05 if is_test else (0.015 if m <= 90 else 0.006)
+
+        for _, r in candidates_df.iterrows():
+            c, name = r["code"], meta_dict[r["code"]]["name"]
+            try:
+                rng = max(0.0, r["high"] - r["low"])
+                if (r["high"] - r["last"]) / max(1e-9, r["high"]) > pb_lim:
+                    stats["回落過大"].append(f"{c} {name}")
+                    continue
+                if rng > 0.1 and (r["last"] - r["low"]) / max(1e-9, rng) < (0.5 if is_test else 0.80):
+                    stats["收盤太弱"].append(f"{c} {name}")
+                    continue
+
+                near_limit = abs(r["last"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
+                high_is_limit = abs(r["high"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
+                if near_limit and high_is_limit and abs(r["last"] - r["high"]) <= max(tw_tick(r["last"]), r["last"] * 0.0005):
+                    status = "🔥 鎖價跡象"
+                elif near_limit:
+                    status = "🚀 漲停附近"
+                else:
+                    status = "⚡ 發動"
+
+                vol_score = max(0.1, min(99.9, r["vol_sh"] / 1000.0 / 1000.0))
+                results.append({
+                    "代號": c,
+                    "名稱": name,
+                    "現價": r["last"],
+                    "爆量": vol_score,
+                    "狀態": status + "（降級）",
+                    "階段": "排行候選",
+                    "board_val": 0,
+                    "漲幅%": r.get("chg_pct", 0.0),
+                })
+            except Exception as e:
+                yf_diag["other_err"] += 1
+                diag_err(diag, e, "FILTER_RANK_ONLY")
+
+        res_df = pd.DataFrame(results)
+        if not res_df.empty:
+            res_df = res_df.sort_values(["漲幅%", "爆量"], ascending=[False, False])
+        return res_df, stats, yf_diag
+
     t_yf_start = time.perf_counter()
     raw_daily = None
 
@@ -752,7 +807,10 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
 # MAIN
 # =========================
 st.markdown('<div class="title">起漲戰情室 ULTRA</div>', unsafe_allow_html=True)
-st.markdown('<div class="status-caption">排行候選池 v8.2｜低請求量｜WantGoo + YF 雙引擎</div>', unsafe_allow_html=True)
+st.markdown('<div class="status-caption">排行候選池 v8.4｜多來源 fallback｜可無 YF 降級</div>', unsafe_allow_html=True)
+
+if not HAS_YF:
+    st.warning('⚠️ 目前環境未安裝 yfinance，系統已自動切換成「排行即時候選模式」。若要恢復血統/20日量均濾網，請在 requirements.txt 加入 yfinance。')
 
 col_cfg = st.columns([1.2, 1.2, 1])
 with col_cfg[0]:
@@ -827,7 +885,7 @@ if scan:
         c1.metric("股票主清單", d.get("meta_count", 0))
         c2.metric("排行有效解析", d.get("rank_parse_ok", 0))
         st.caption(f"📡 資料源：{d.get('rank_source', '-')} | 候選池 {d.get('rank_rows', 0)} 檔 | Request ERR {d.get('rank_req_err', 0)}")
-        c3.metric("YF 數據覆蓋", f"{d.get('yf_returned', 0)} / {d.get('yf_symbols', 0)}")
+        c3.metric("YF 數據覆蓋", '未安裝 / 降級' if not HAS_YF else f"{d.get('yf_returned', 0)} / {d.get('yf_symbols', 0)}")
         rescue_msg = f"{'🟢 啟動' if d.get('yf_rescue_used', 0) else '⚪ 待命'} | ERR {d.get('other_err', 0)}"
         c4.metric("救援協議 / 錯誤", rescue_msg)
         if d.get("yf_rescue_used", 0):

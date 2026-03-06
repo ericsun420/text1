@@ -366,7 +366,7 @@ def fetch_official_tpex_snapshot(date_str: str) -> Tuple[pd.DataFrame, str]:
 
 
 @st.cache_data(ttl=SNAPSHOT_CACHE_TTL, show_spinner=False)
-def fetch_official_combined_snapshot(max_rows: int = 300):
+def fetch_official_combined_snapshot(max_rows: int | None = 300):
     errors = []
     twse_df = pd.DataFrame()
     try:
@@ -399,7 +399,9 @@ def fetch_official_combined_snapshot(max_rows: int = 300):
         raise RuntimeError("官方來源回傳空資料")
     df = df.sort_values(["vol_lots", "chg_pct"], ascending=[False, False]).drop_duplicates("code", keep="first")
     asof = roc_to_gregorian(tpex_asof) if tpex_asof else now_taipei().strftime("%Y/%m/%d")
-    return df.head(max_rows).reset_index(drop=True), asof, "官方收盤快照(TWSE+TPEX)", errors
+    if max_rows is not None:
+        df = df.head(max_rows)
+    return df.reset_index(drop=True), asof, "官方收盤快照(TWSE+TPEX)", errors
 
 
 # =========================
@@ -659,13 +661,17 @@ def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
     phase = market_phase(now_ts)
     diag["source_mode"] = "官方優先"
     errors = []
+    official_backup_df = pd.DataFrame()
+    official_backup_asof = ""
 
     # 盤後/盤前優先用官方收盤快照；盤中先試官方，若日期明顯落後再切 HTML live。
     try:
         status_placeholder.update(label="🏛️ 官方來源優先檢查中...", state="running")
-        official_df, official_asof, official_name, official_errors = fetch_official_combined_snapshot(320)
+        official_df, official_asof, official_name, official_errors = fetch_official_combined_snapshot(None)
         errors.extend(official_errors)
         official_df = enrich_market_from_meta(official_df, merge_meta(meta_dict, official_df))
+        official_backup_df = official_df.copy()
+        official_backup_asof = official_asof
         official_is_today = False
         if official_asof:
             try:
@@ -677,7 +683,7 @@ def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
         if phase != "live" or official_is_today:
             diag["rank_source"] = official_name
             diag["rank_asof"] = official_asof
-            return official_df
+            return official_df, official_backup_df, official_backup_asof
         errors.append(f"官方日期較舊: {official_asof}")
     except Exception as e:
         diag["rank_req_err"] += 1
@@ -693,7 +699,7 @@ def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
             diag["rank_source"] = html_name
             diag["rank_asof"] = html_asof
             diag["source_mode"] = "官方失敗 / HTML備援"
-            return html_df
+            return html_df, official_backup_df, official_backup_asof
     except Exception as e:
         diag["rank_req_err"] += 1
         diag_err(diag, e, "HTML_FALLBACK")
@@ -702,7 +708,7 @@ def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
     diag["rank_source"] = "失敗"
     for msg in errors[-5:]:
         diag_err(diag, Exception(msg), "RANK_CHAIN")
-    return pd.DataFrame()
+    return pd.DataFrame(), official_backup_df, official_backup_asof
 
 
 # =========================
@@ -1062,6 +1068,254 @@ def recompute_from_snapshot(snapshot, is_test, use_bloodline):
 
 
 # =========================
+# SINGLE SEARCH / SCORING
+# =========================
+def _score_badge(score: int) -> str:
+    if score >= 9:
+        return "S級戰神"
+    if score >= 8:
+        return "A級強攻"
+    if score >= 7:
+        return "B級觀察"
+    if score >= 5:
+        return "C級偏震盪"
+    return "D級弱勢"
+
+
+def _resolve_search_row(query: str, snapshot: dict):
+    q = str(query or "").strip()
+    if not q:
+        return None, []
+    q_lower = q.lower()
+    raw_df = snapshot.get("raw_rank_df", pd.DataFrame())
+    backup_df = snapshot.get("search_backup_df", pd.DataFrame())
+    meta = snapshot.get("meta", {})
+
+    def _match_df(df: pd.DataFrame, source_label: str, stale_note: str = ""):
+        if df is None or df.empty:
+            return None, []
+        work = df.copy()
+        work["code"] = work["code"].astype(str).str.strip()
+        work["name"] = work["name"].astype(str).str.strip()
+        exact_code = work[work["code"] == q]
+        exact_name = work[work["name"] == q]
+        fuzzy = work[work["code"].str.contains(q, case=False, na=False) | work["name"].str.lower().str.contains(q_lower, na=False)]
+        target = None
+        if not exact_code.empty:
+            target = exact_code.iloc[0].to_dict()
+        elif not exact_name.empty:
+            target = exact_name.iloc[0].to_dict()
+        elif not fuzzy.empty:
+            target = fuzzy.iloc[0].to_dict()
+        matches = []
+        if not fuzzy.empty:
+            for _, rr in fuzzy.head(8).iterrows():
+                matches.append(f"{rr['code']} {rr['name']}")
+        if target is not None:
+            target["search_source"] = source_label
+            target["stale_note"] = stale_note
+        return target, matches
+
+    row, matches = _match_df(raw_df, "本輪快照")
+    if row is not None:
+        return row, matches
+
+    backup_asof = snapshot.get("search_backup_asof", "")
+    stale_note = f"官方前一日快照 {backup_asof}" if backup_asof else "官方前一日快照"
+    row, matches = _match_df(backup_df, stale_note, stale_note)
+    if row is not None:
+        return row, matches
+
+    meta_matches = []
+    for code, info in meta.items():
+        name = str(info.get("name", code))
+        if q == code or q_lower in name.lower():
+            meta_matches.append(f"{code} {name}")
+    return None, meta_matches[:8]
+
+
+def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test: bool, use_bloodline: bool):
+    code = str(row.get("code", "")).strip()
+    name = str(meta_dict.get(code, {}).get("name", row.get("name", code)))
+    market = str(meta_dict.get(code, {}).get("ex", row.get("market", "")))
+    last = float(row.get("last", math.nan))
+    high = float(row.get("high", math.nan))
+    low = float(row.get("low", math.nan))
+    vol_lots = float(row.get("vol_lots", math.nan))
+    chg = float(row.get("chg", 0.0)) if pd.notna(row.get("chg", 0.0)) else 0.0
+    chg_pct = float(row.get("chg_pct", 0.0)) if pd.notna(row.get("chg_pct", 0.0)) else 0.0
+    prev_close = float(row.get("prev_close", math.nan)) if pd.notna(row.get("prev_close", math.nan)) else math.nan
+    if (not math.isfinite(prev_close)) or prev_close <= 0:
+        prev_close = round(last - chg, 2)
+    if last <= 0 or prev_close <= 0:
+        return {"status": "error", "message": "個股快照欄位不足，無法評分。"}
+
+    upper = calc_limit_up(prev_close, 0.10)
+    dist_pct = max(0.0, ((upper - last) / upper) * 100)
+    rng = max(0.0, high - low)
+    range_pos = 1.0 if rng <= 0 else (last - low) / max(rng, 1e-9)
+    pullback_pct = ((high - last) / high) * 100 if high > 0 else 0.0
+    near_limit = abs(last - upper) <= max(tw_tick(upper), upper * 0.0005)
+    high_is_limit = abs(high - upper) <= max(tw_tick(upper), upper * 0.0005)
+
+    score = 5.0
+    strengths, warnings, filter_flags = [], [], []
+
+    if dist_pct <= 1.0:
+        score += 1.8; strengths.append("距漲停極近")
+    elif dist_pct <= 2.0:
+        score += 1.2; strengths.append("接近漲停")
+    elif dist_pct <= 4.0:
+        score += 0.6
+    else:
+        score -= 0.8; warnings.append("離漲停仍有距離")
+
+    if chg_pct >= 9.0:
+        score += 1.6; strengths.append("漲幅接近漲停")
+    elif chg_pct >= 7.0:
+        score += 1.2
+    elif chg_pct >= 5.0:
+        score += 0.8
+    elif chg_pct >= 3.0:
+        score += 0.4
+    elif chg_pct < 0:
+        score -= 1.2; warnings.append("當前漲幅為負")
+
+    if range_pos >= 0.82:
+        score += 1.0; strengths.append("收盤位置貼近高點")
+    elif range_pos >= 0.65:
+        score += 0.5
+    elif range_pos < (0.5 if is_test else 0.80) and rng > 0.1:
+        score -= 1.1; warnings.append("收盤位置偏低")
+        filter_flags.append("收盤太弱")
+
+    pb_lim = 5.0 if is_test else (1.5 if now_ts.time() <= dtime(10, 30) else 0.9)
+    if pullback_pct <= pb_lim * 0.45:
+        score += 0.6; strengths.append("回落控制良好")
+    elif pullback_pct > pb_lim:
+        score -= 1.0; warnings.append("從高點回落偏大")
+        filter_flags.append("回落過大")
+
+    board_count = 0
+    vol_ratio = math.nan
+    vol_note = ""
+    yf_status = "降級"
+
+    if HAS_YF and code in meta_dict:
+        sym = f"{code}.{'TW' if market == 'tse' else 'TWO'}"
+        raw = yf_download_daily((sym,), "180d")
+        if raw is not None and not getattr(raw, "empty", False):
+            try:
+                df_sym = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+                dfD = df_sym[["Close", "Volume"]].dropna()
+                if len(dfD) >= 30:
+                    dates_tw = idx_date_taipei(dfD.index)
+                    past_df = dfD[dates_tw < now_ts.date()].copy()
+                    if len(past_df) >= 30:
+                        vol_ma20_sh = float(past_df["Volume"].rolling(20).mean().iloc[-1])
+                        if math.isfinite(vol_ma20_sh) and vol_ma20_sh > 0:
+                            m = int((datetime.combine(now_ts.date(), now_ts.time()) - datetime.combine(now_ts.date(), dtime(9, 0))).total_seconds() // 60)
+                            m = max(0, min(270, m))
+                            frac = 0.5 if is_test else (0.12 if m <= 30 else 0.12 + (0.5 - 0.12) * ((m - 30) / 90.0) if m <= 120 else min(1.0, 0.5 + (1.0 - 0.5) * ((m - 120) / 150.0)))
+                            vol_ratio = (vol_lots * 1000.0) / (vol_ma20_sh * frac + 1e-9)
+                            yf_status = "YF量能有效"
+                            vol_note = f"20日均量校正後 {vol_ratio:.2f}x"
+
+                        past_10 = past_df.tail(10)
+                        for i in range(len(past_10) - 1, 0, -1):
+                            cp, pp = float(past_10["Close"].iloc[i]), float(past_10["Close"].iloc[i - 1])
+                            lim = infer_daily_limit(pp, cp)
+                            if cp >= (lim - tw_tick(lim)):
+                                board_count += 1
+                            else:
+                                break
+            except Exception:
+                pass
+
+    if not math.isfinite(vol_ratio):
+        base_lots = 200.0 if is_test else 2500.0
+        vol_ratio = max(0.05, vol_lots / base_lots)
+        vol_note = f"候選基準量能 {vol_ratio:.2f}x"
+
+    if vol_ratio >= 2.5:
+        score += 1.6; strengths.append("量能明顯超標")
+    elif vol_ratio >= 1.8:
+        score += 1.1
+    elif vol_ratio >= 1.3:
+        score += 0.6
+    elif vol_ratio < (0.5 if is_test else 1.3):
+        score -= 1.2; warnings.append("量能不足")
+        filter_flags.append("爆量不足")
+
+    if board_count >= 2:
+        score += 0.9; strengths.append("連板血統強")
+    elif board_count == 1:
+        score += 0.5; strengths.append("具連板血統")
+    elif use_bloodline and HAS_YF and (not is_test):
+        score -= 0.8; warnings.append("無連板血統")
+        filter_flags.append("非連板標的")
+
+    score = int(max(0, min(10, round(score))))
+
+    if near_limit and high_is_limit and pullback_pct <= max(0.2, pb_lim * 0.2):
+        action = "通過嚴選，可列入戰區"
+        status = "🔥 鎖價跡象"
+    elif score >= 8 and len(filter_flags) <= 1:
+        action = "高分觀察，可盯盤"
+        status = "🚀 漲停附近" if near_limit else "⚡ 強勢發動"
+    elif score >= 6:
+        action = "中性觀察，需等確認"
+        status = "👀 觀察"
+    else:
+        action = "不建議追價"
+        status = "🧊 偏弱"
+
+    return {
+        "status": "ok",
+        "code": code,
+        "name": name,
+        "market": market,
+        "last": last,
+        "chg_pct": chg_pct,
+        "vol_lots": vol_lots,
+        "prev_close": prev_close,
+        "upper": upper,
+        "dist_pct": dist_pct,
+        "range_pos": range_pos * 100,
+        "pullback_pct": pullback_pct,
+        "board_count": board_count,
+        "vol_ratio": vol_ratio,
+        "vol_note": vol_note,
+        "score": score,
+        "badge": _score_badge(score),
+        "action": action,
+        "live_status": status,
+        "strengths": strengths[:5],
+        "warnings": warnings[:5],
+        "filter_flags": filter_flags[:5],
+        "query_source": row.get("search_source", "本輪快照"),
+        "stale_note": row.get("stale_note", ""),
+        "yf_status": yf_status,
+    }
+
+
+def recompute_single_search(search_state: dict, scan: dict, is_test: bool, use_bloodline: bool):
+    query = str(search_state.get("query", "")).strip()
+    if not query or not scan or not scan.get("snapshot"):
+        return None
+    row, matches = _resolve_search_row(query, scan["snapshot"])
+    if row is None:
+        return {"status": "miss", "query": query, "matches": matches, "is_test": is_test, "use_bloodline": use_bloodline, "ts": scan["ts"]}
+    report = evaluate_single_stock(row, scan["snapshot"]["meta"], scan["ts"], is_test, use_bloodline)
+    report["query"] = query
+    report["matches"] = matches
+    report["is_test"] = is_test
+    report["use_bloodline"] = use_bloodline
+    report["ts"] = scan["ts"]
+    return report
+
+
+# =========================
 # UI / THEME
 # =========================
 st.set_page_config(page_title="起漲戰情室 Ultra", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
@@ -1223,9 +1477,10 @@ if st.button("🚀 啟動戰區掃描"):
 
             t = time.perf_counter()
             now_ts = now_taipei()
-            raw_rank_df = fetch_rank_snapshot(status, diag, base_meta)
+            raw_rank_df, search_backup_df, search_backup_asof = fetch_rank_snapshot(status, diag, base_meta)
             diag["t_rank"] = time.perf_counter() - t
-            merged_meta = merge_meta(base_meta, raw_rank_df)
+            merged_meta = merge_meta(base_meta, raw_rank_df if raw_rank_df is not None else pd.DataFrame())
+            merged_meta = merge_meta(merged_meta, search_backup_df if search_backup_df is not None else pd.DataFrame())
             diag["meta_count"] = len(merged_meta)
 
             pre_df = build_rank_candidates(raw_rank_df, merged_meta, now_ts, is_test, diag)
@@ -1240,6 +1495,8 @@ if st.button("🚀 啟動戰區掃描"):
             "meta": merged_meta,
             "meta_count": len(merged_meta),
             "raw_rank_df": raw_rank_df,
+            "search_backup_df": search_backup_df,
+            "search_backup_asof": search_backup_asof,
             "ts": now_ts,
             "fetch_diag": {
                 "rank_req_err": diag.get("rank_req_err", 0),
@@ -1262,6 +1519,8 @@ if st.button("🚀 啟動戰區掃描"):
             "snapshot": snapshot,
             "instant_switch": False,
         }
+        if st.session_state.get("single_search_state"):
+            st.session_state["single_search_report"] = recompute_single_search(st.session_state["single_search_state"], st.session_state["last_scan"], is_test, use_bloodline)
         st.rerun()
 
 scan = st.session_state.get("last_scan")
@@ -1287,6 +1546,74 @@ if scan:
     m2.metric("嚴選錄取檔數", len(res))
     m3.metric("排行解析良率", f"{(d.get('rank_parse_ok', 0) / max(1, total_parse) * 100):.1f}%")
     m4.metric("系統異常阻擋", d.get("rank_req_err", 0) + d.get("yf_fail", 0) + d.get("other_err", 0))
+
+    st.markdown('<div class="glass" style="margin-top:16px; margin-bottom:16px;">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🔎 獨立搜索評分</div>', unsafe_allow_html=True)
+    st.caption("輸入股票代號或名稱，系統會用同一份快照與同一套規則做單檔評分；若盤中只抓到排行池，查不到的股票會明確提示。")
+    s1, s2 = st.columns([2.2, 1])
+    with s1:
+        st.text_input("輸入代號 / 名稱", key="single_search_query", placeholder="例如 3017、群創、8299")
+    with s2:
+        search_clicked = st.button("🎯 搜索並評分", key="single_search_button")
+
+    if search_clicked:
+        q = st.session_state.get("single_search_query", "").strip()
+        st.session_state["single_search_state"] = {"query": q}
+        st.session_state["single_search_report"] = recompute_single_search(st.session_state["single_search_state"], scan, is_test, use_bloodline)
+        st.rerun()
+
+    search_state = st.session_state.get("single_search_state")
+    search_report = st.session_state.get("single_search_report")
+    if search_state and search_report and (search_report.get("is_test") != is_test or search_report.get("use_bloodline") != use_bloodline or search_report.get("ts") != scan.get("ts")):
+        st.session_state["single_search_report"] = recompute_single_search(search_state, scan, is_test, use_bloodline)
+        search_report = st.session_state.get("single_search_report")
+
+    if search_report:
+        if search_report.get("status") == "ok":
+            sr = search_report
+            left, right = st.columns([1.15, 1.85])
+            with left:
+                card_html = (
+                    f'<div class="pro-card" style="min-height:230px;">'
+                    f'<div class="tag-pro">{sr["badge"]}</div>'
+                    f'<div class="stock-name" style="margin-top:10px;">{sr["code"]} {sr["name"]}</div>'
+                    f'<div class="price-large">{sr["last"]:.2f}</div>'
+                    f'<div style="margin-top:10px; color:#dce9f8; font-size:16px; font-weight:800;">系統評分 {sr["score"]}/10</div>'
+                    f'<div style="margin-top:8px; color:#9cb1c7; font-weight:700;">{sr["live_status"]} ｜ {sr["action"]}</div>'
+                    f'<div style="margin-top:8px; color:#9cb1c7; font-size:13px;">來源：{sr["query_source"]}{(" ｜ " + sr["stale_note"]) if sr.get("stale_note") else ""}</div>'
+                    '</div>'
+                )
+                st.markdown(card_html, unsafe_allow_html=True)
+            with right:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("漲幅", f'{sr["chg_pct"]:.2f}%')
+                c2.metric("距漲停", f'{sr["dist_pct"]:.2f}%')
+                c3.metric("量能", f'{sr["vol_ratio"]:.2f}x')
+                c4.metric("血統", f'{sr["board_count"]} 板')
+                c5, c6, c7 = st.columns(3)
+                c5.metric("回落", f'{sr["pullback_pct"]:.2f}%')
+                c6.metric("收盤位置", f'{sr["range_pos"]:.1f}%')
+                c7.metric("資料模式", sr["yf_status"])
+                st.markdown("**加分點**")
+                if sr.get("strengths"):
+                    st.markdown("<div>" + "".join([f'<span class="badge green">+ {x}</span>' for x in sr["strengths"]]) + "</div>", unsafe_allow_html=True)
+                else:
+                    st.caption("目前沒有明顯加分點。")
+                st.markdown("**風險 / 扣分**")
+                if sr.get("warnings"):
+                    st.markdown("<div>" + "".join([f'<span class="fail-tag">{x}</span>' for x in sr["warnings"]]) + "</div>", unsafe_allow_html=True)
+                else:
+                    st.caption("目前沒有明顯扣分警示。")
+                if sr.get("filter_flags"):
+                    st.caption("濾網警示：" + "、".join(sr["filter_flags"]))
+                st.caption(sr.get("vol_note", ""))
+        elif search_report.get("status") == "miss":
+            st.warning("查無本輪可評估快照資料。")
+            if search_report.get("matches"):
+                st.caption("你可能想找：" + "｜".join(search_report["matches"]))
+        elif search_report.get("status") == "error":
+            st.error(search_report.get("message", "單股評估失敗"))
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # Calibration panel
     if HAS_YF:

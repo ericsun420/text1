@@ -1,37 +1,44 @@
-# app.py — 起漲戰情室｜戰神 v8.2 WantGoo Rank Source 版｜低請求量｜排行候選池｜Apple Pro
+# app.py — 起漲戰情室｜戰神 v8.7 官方API優先版｜多來源備援｜即時切換｜訊號校準
 import io
 import math
 import re
 import time
-from datetime import datetime, timedelta, time as dtime
 from collections import deque
+from datetime import datetime, timedelta, time as dtime
+from typing import Dict, List, Tuple
 
+import pandas as pd
 import requests
+import streamlit as st
+import urllib3
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import urllib3
-import pandas as pd
+
 try:
     import yfinance as yf
     HAS_YF = True
 except Exception:
     yf = None
     HAS_YF = False
-import streamlit as st
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# =========================
-# SYSTEM DIAGNOSTICS & CONSTANTS
-# =========================
-HTTP_TIMEOUT = (3.0, 10.0)
-RANK_SOURCES = [
+HTTP_TIMEOUT = (3.0, 12.0)
+RANK_CACHE_TTL = 12
+SNAPSHOT_CACHE_TTL = 60
+YF_CACHE_TTL = 6 * 3600
+CALIBRATION_LOOKBACK_DAYS = 180
+CALIBRATION_SYMBOL_CAP = 16
+
+OFFICIAL_TWSE_STOCK_DAY_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+OFFICIAL_TPEX_DAILY_CLOSE = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+
+HTML_FALLBACK_SOURCES = [
     {"name": "Yahoo 台股成交量排行", "url": "https://tw.stock.yahoo.com/rank/volume", "kind": "yahoo"},
     {"name": "HiStock 即時成交量排行", "url": "https://histock.tw/stock/rank.aspx?d=1&m=11&t=dt", "kind": "histock"},
     {"name": "WantGoo 成交量排行", "url": "https://www.wantgoo.com/stock/ranking/volume", "kind": "wantgoo"},
 ]
-
-RANK_CACHE_TTL = 12
 
 
 def diag_init():
@@ -45,6 +52,7 @@ def diag_init():
         "rank_rows": 0,
         "rank_source": "-",
         "rank_asof": "",
+        "source_mode": "-",
         "yf_symbols": 0,
         "yf_returned": 0,
         "yf_fail": 0,
@@ -53,17 +61,111 @@ def diag_init():
         "yf_rescue_used": 0,
         "yf_parts_ok": 0,
         "yf_parts_fail": 0,
-        "last_errors": deque(maxlen=10),
+        "last_errors": deque(maxlen=12),
         "t_meta": 0.0,
         "t_rank": 0.0,
         "t_yf": 0.0,
         "t_filter": 0.0,
+        "t_cal": 0.0,
         "total": 0.0,
     }
 
 
 def diag_err(diag, e, tag="ERR"):
     diag["last_errors"].append(f"[{tag}] {type(e).__name__}: {e}")
+
+
+def now_taipei():
+    return datetime.utcnow() + timedelta(hours=8)
+
+
+def tw_roc_date(dt_obj: datetime) -> str:
+    return f"{dt_obj.year - 1911}/{dt_obj.month:02d}/{dt_obj.day:02d}"
+
+
+def roc_to_gregorian(roc_date: str) -> str:
+    try:
+        y, m, d = [int(x) for x in str(roc_date).split("/")]
+        return f"{y + 1911:04d}/{m:02d}/{d:02d}"
+    except Exception:
+        return str(roc_date)
+
+
+def tw_tick(price):
+    return 0.01 if price < 10 else 0.05 if price < 50 else 0.1 if price < 100 else 0.5 if price < 500 else 1.0 if price < 1000 else 5.0
+
+
+def calc_limit_up(prev_close, limit_pct=0.10):
+    raw = prev_close * (1.0 + limit_pct)
+    tick = tw_tick(raw)
+    n = math.floor((raw + 1e-12) / tick)
+    return round(n * tick, 2 if tick < 0.1 else 1 if tick < 1 else 0)
+
+
+def infer_daily_limit(pp, cp):
+    l10 = calc_limit_up(pp, 0.10)
+    l20 = calc_limit_up(pp, 0.20)
+    tol20 = max(tw_tick(l20), l20 * 0.0005)
+    if abs(cp - l20) <= tol20 and abs(cp - l20) < abs(cp - l10):
+        return l20
+    return l10
+
+
+def idx_date_taipei(idx):
+    try:
+        if getattr(idx, "tz", None) is not None:
+            try:
+                return idx.tz_convert("Asia/Taipei").date
+            except Exception:
+                return idx.tz_localize(None).date
+    except Exception:
+        pass
+    return idx.date
+
+
+def _is_ssl_like(e: Exception) -> bool:
+    s = str(e).lower()
+    if "ssl" in s or "certificate" in s or "cert" in s:
+        return True
+    cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
+    if cause and ("ssl" in str(cause).lower() or "certificate" in str(cause).lower()):
+        return True
+    return False
+
+
+def _to_float(x):
+    if pd.isna(x):
+        return math.nan
+    s = str(x).strip().replace(",", "").replace("％", "%")
+    s = s.replace("▲", "").replace("△", "")
+    s = s.replace("▼", "-")
+    s = s.replace("▽", "-")
+    s = s.replace("−", "-")
+    s = s.replace("+", "")
+    s = s.replace("--", "-")
+    s = s.replace("%", "")
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if s in ("", "-", ".", "-."):
+        return math.nan
+    try:
+        return float(s)
+    except Exception:
+        return math.nan
+
+
+def _clean_name(x: str) -> str:
+    s = re.sub(r"\s+", " ", str(x or "")).strip()
+    s = re.sub(r"\((?:上市|上櫃)\)", "", s)
+    return s.strip()
+
+
+def _normalize_code(x: str) -> str:
+    m = re.search(r"([0-9]{4,6}[A-Z]?)", str(x or ""))
+    return m.group(1) if m else ""
+
+
+def _safe_pct(num, den):
+    return 0.0 if den == 0 else num / den
 
 
 def get_github_headers():
@@ -75,13 +177,7 @@ def get_github_headers():
     }
 
 
-RANK_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-)
-
-
-def get_rank_headers(url: str = ""):
+def get_browser_headers(url: str = ""):
     referer = "https://www.google.com/"
     if "yahoo.com" in url:
         referer = "https://tw.stock.yahoo.com/"
@@ -89,15 +185,20 @@ def get_rank_headers(url: str = ""):
         referer = "https://histock.tw/"
     elif "wantgoo.com" in url:
         referer = "https://www.wantgoo.com/stock"
+    elif "openapi.twse.com.tw" in url:
+        referer = "https://openapi.twse.com.tw/"
+    elif "tpex.org.tw" in url:
+        referer = "https://www.tpex.org.tw/openapi/"
     return {
-        "User-Agent": RANK_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
         "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
         "Referer": referer,
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
 
 
@@ -118,38 +219,49 @@ def make_retry_session(base_headers=None):
     return s
 
 
-def _is_ssl_like(e: Exception) -> bool:
-    s = str(e).lower()
-    if "ssl" in s or "certificate" in s or "cert" in s:
-        return True
-    cause = getattr(e, "__cause__", None) or getattr(e, "__context__", None)
-    if cause and ("ssl" in str(cause).lower() or "certificate" in str(cause).lower()):
-        return True
-    return False
-
-
-def safe_get(session, url, timeout, diag=None):
+def safe_get(session, url, timeout=HTTP_TIMEOUT, params=None, diag=None):
     try:
-        return session.get(url, timeout=timeout, verify=True)
+        return session.get(url, timeout=timeout, params=params, verify=True)
     except requests.exceptions.RequestException as e:
         if _is_ssl_like(e):
             if diag is not None:
                 diag_err(diag, e, "SSL_DOWNGRADE")
-            return session.get(url, timeout=timeout, verify=False)
+            return session.get(url, timeout=timeout, params=params, verify=False)
         raise
 
 
-# =========================
-# DATA FETCHING
-# =========================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_text(url: str):
     s = make_retry_session(base_headers=get_github_headers())
-    r = s.get(url, timeout=(3.0, 15.0), verify=True)
+    r = safe_get(s, url, timeout=(3.0, 15.0))
     r.raise_for_status()
     return r.text.replace("\r", "")
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def yf_download_daily(syms: Tuple[str, ...], period: str = "180d"):
+    if (not HAS_YF) or (not syms):
+        return None
+    df = yf.download(
+        tickers=" ".join(list(syms)),
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        threads=True,
+        progress=False,
+    )
+    if df is None or getattr(df, "empty", False):
+        return df
+    if not isinstance(df.columns, pd.MultiIndex):
+        t = syms[0]
+        df.columns = pd.MultiIndex.from_product([[t], df.columns])
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+    return df
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def get_stock_list():
     meta, errors = {}, []
     urls = [
@@ -172,63 +284,154 @@ def get_stock_list():
                 if len(code) == 4 and code.isdigit():
                     meta[code] = {"name": str(row[n_col]), "ex": ex}
         except Exception as e:
-            if not isinstance(e, pd.errors.ParserError):
-                errors.append(f"{ex} - {str(e)}")
+            errors.append(f"{ex} - {type(e).__name__}: {e}")
     return meta, errors
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def yf_download_daily(syms):
-    if (not HAS_YF) or (not syms):
-        return None
-    df = yf.download(
-        tickers=" ".join(syms),
-        period="120d",
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True,
-        progress=False,
-    )
-    if df is None or getattr(df, "empty", False):
-        return df
-    if not isinstance(df.columns, pd.MultiIndex):
-        t = syms[0]
-        df.columns = pd.MultiIndex.from_product([[t], df.columns])
-    df = df[~df.index.duplicated(keep="last")]
-    df = df.sort_index()
-    return df
+# =========================
+# OFFICIAL SOURCES (PRIORITY)
+# =========================
+def _first_value(row: dict, candidates: List[str], default=""):
+    for key in candidates:
+        if key in row and str(row.get(key, "")).strip() != "":
+            return row.get(key)
+    return default
 
 
-def _flatten_columns(cols):
+def _normalize_official_rows(rows: List[dict], market: str, asof: str = "") -> pd.DataFrame:
     out = []
-    for c in cols:
-        if isinstance(c, tuple):
-            text = "".join([str(x) for x in c if str(x) != "nan"])
-        else:
-            text = str(c)
-        text = re.sub(r"\s+", "", text)
-        out.append(text)
-    return out
+    for row in rows or []:
+        code = _normalize_code(_first_value(row, ["Code", "股票代號", "SecuritiesCompanyCode", "證券代號", "證券代碼"]))
+        name = _clean_name(_first_value(row, ["Name", "股票名稱", "CompanyName", "證券名稱"]))
+        last = _to_float(_first_value(row, ["ClosingPrice", "收盤價", "Close", "收盤"] ))
+        high = _to_float(_first_value(row, ["HighestPrice", "最高價", "High", "最高"]))
+        low = _to_float(_first_value(row, ["LowestPrice", "最低價", "Low", "最低"]))
+        open_p = _to_float(_first_value(row, ["OpeningPrice", "開盤價", "Open", "開盤"]))
+        change = _to_float(_first_value(row, ["Change", "漲跌價差", "漲跌", "漲跌價"] ))
+        dir_sign = str(_first_value(row, ["Dir", "漲跌(+/-)", "漲跌註記", "UpDown", "Direction"], default="")).strip()
+        if math.isfinite(change) and dir_sign in ("-", "▽", "▼"):
+            change = -abs(change)
+        elif math.isfinite(change) and dir_sign in ("+", "△", "▲"):
+            change = abs(change)
+        vol_sh = _to_float(_first_value(row, ["TradeVolume", "成交股數", "成交量", "Volume"]))
+        prev_close = _to_float(_first_value(row, ["YesterdayClosingPrice", "前日收盤價", "昨收", "PreviousClose"]))
+
+        if not code or not math.isfinite(last) or last <= 0 or not math.isfinite(vol_sh) or vol_sh <= 0:
+            continue
+        if not math.isfinite(high) or high <= 0:
+            high = max(last, open_p if math.isfinite(open_p) else last)
+        if not math.isfinite(low) or low <= 0:
+            low = min(last, open_p if math.isfinite(open_p) else last)
+        if (not math.isfinite(prev_close) or prev_close <= 0) and math.isfinite(change):
+            prev_close = round(last - change, 2)
+        if (not math.isfinite(change)) and math.isfinite(prev_close) and prev_close > 0:
+            change = last - prev_close
+        chg_pct = _safe_pct(last - prev_close, prev_close) * 100 if math.isfinite(prev_close) and prev_close > 0 else math.nan
+
+        out.append({
+            "code": code,
+            "name": name,
+            "last": last,
+            "chg": change if math.isfinite(change) else 0.0,
+            "chg_pct": chg_pct,
+            "high": high,
+            "low": low,
+            "vol_lots": vol_sh / 1000.0,
+            "prev_close": prev_close,
+            "market": market,
+            "asof": asof,
+        })
+    return pd.DataFrame(out)
 
 
-def _to_float(x):
-    if pd.isna(x):
-        return math.nan
-    s = str(x).strip().replace(",", "").replace("％", "%")
-    s = s.replace("▲", "")
-    s = s.replace("△", "")
-    s = s.replace("▼", "-")
-    s = s.replace("−", "-")
-    s = s.replace("%", "")
-    s = re.sub(r"[^0-9.\-]", "", s)
-    s = s.replace("--", "-")
-    if s in ("", "-", ".", "-."):
-        return math.nan
+@st.cache_data(ttl=SNAPSHOT_CACHE_TTL, show_spinner=False)
+def fetch_official_twse_snapshot() -> Tuple[pd.DataFrame, str]:
+    s = make_retry_session(base_headers=get_browser_headers(OFFICIAL_TWSE_STOCK_DAY_ALL))
+    r = safe_get(s, OFFICIAL_TWSE_STOCK_DAY_ALL, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    rows = r.json()
+    df = _normalize_official_rows(rows, market="tse")
+    return df, ""
+
+
+@st.cache_data(ttl=SNAPSHOT_CACHE_TTL, show_spinner=False)
+def fetch_official_tpex_snapshot(date_str: str) -> Tuple[pd.DataFrame, str]:
+    s = make_retry_session(base_headers=get_browser_headers(OFFICIAL_TPEX_DAILY_CLOSE))
+    params = {"l": "zh-tw", "d": date_str, "s": "0,asc,0"}
+    r = safe_get(s, OFFICIAL_TPEX_DAILY_CLOSE, timeout=HTTP_TIMEOUT, params=params)
+    r.raise_for_status()
+    rows = r.json()
+    df = _normalize_official_rows(rows, market="otc", asof=date_str)
+    return df, date_str
+
+
+@st.cache_data(ttl=SNAPSHOT_CACHE_TTL, show_spinner=False)
+def fetch_official_combined_snapshot(max_rows: int = 300):
+    errors = []
+    twse_df = pd.DataFrame()
     try:
-        return float(s)
-    except Exception:
-        return math.nan
+        twse_df, _ = fetch_official_twse_snapshot()
+    except Exception as e:
+        errors.append(f"TWSE官方: {type(e).__name__}: {e}")
+
+    tpex_df = pd.DataFrame()
+    tpex_asof = ""
+    today = now_taipei().replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(0, 8):
+        probe = today - timedelta(days=i)
+        try:
+            tpex_df, tpex_asof = fetch_official_tpex_snapshot(tw_roc_date(probe))
+            if tpex_df is not None and not tpex_df.empty:
+                break
+        except Exception as e:
+            errors.append(f"TPEX官方[{tw_roc_date(probe)}]: {type(e).__name__}: {e}")
+
+    if (twse_df is None or twse_df.empty) and (tpex_df is None or tpex_df.empty):
+        raise RuntimeError(" | ".join(errors) if errors else "官方來源皆失敗")
+
+    frames = []
+    if twse_df is not None and not twse_df.empty:
+        frames.append(twse_df)
+    if tpex_df is not None and not tpex_df.empty:
+        frames.append(tpex_df)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
+        raise RuntimeError("官方來源回傳空資料")
+    df = df.sort_values(["vol_lots", "chg_pct"], ascending=[False, False]).drop_duplicates("code", keep="first")
+    asof = roc_to_gregorian(tpex_asof) if tpex_asof else now_taipei().strftime("%Y/%m/%d")
+    return df.head(max_rows).reset_index(drop=True), asof, "官方收盤快照(TWSE+TPEX)", errors
+
+
+# =========================
+# HTML FALLBACK SOURCES
+# =========================
+def _extract_tables_with_bs4(html: str) -> List[pd.DataFrame]:
+    soup = BeautifulSoup(html, "html.parser")
+    tables = []
+    for table in soup.find_all("table"):
+        rows = []
+        headers = []
+        trs = table.find_all("tr")
+        if not trs:
+            continue
+        for tr in trs:
+            ths = tr.find_all(["th"])
+            if ths and not headers:
+                headers = [re.sub(r"\s+", "", th.get_text(" ", strip=True)) for th in ths]
+                continue
+            tds = tr.find_all(["td"])
+            if tds:
+                row = [td.get_text(" ", strip=True) for td in tds]
+                rows.append(row)
+        if not rows:
+            continue
+        width = max(len(headers), max(len(r) for r in rows))
+        headers = headers[:width] + [f"col{i}" for i in range(len(headers), width)]
+        normalized = [r[:width] + [""] * (width - len(r)) for r in rows]
+        df = pd.DataFrame(normalized, columns=headers)
+        if not df.empty:
+            tables.append(df)
+    return tables
 
 
 def _find_col(df, keywords):
@@ -243,18 +446,11 @@ def _find_col(df, keywords):
     return None
 
 
-def _clean_name(x: str) -> str:
-    s = re.sub(r"\s+", " ", str(x or "")).strip()
-    s = re.sub(r"\((?:上市|上櫃)\)", "", s)
-    return s.strip()
-
-
 def _pick_best_table(tables, required_tokens):
     best_df = None
     best_score = -1
     for t in tables:
-        cols = _flatten_columns(t.columns)
-        score = sum(1 for token in required_tokens if any(token in c for c in cols))
+        score = sum(1 for token in required_tokens if any(token in str(c) for c in t.columns))
         if score > best_score:
             best_df = t.copy()
             best_score = score
@@ -262,15 +458,11 @@ def _pick_best_table(tables, required_tokens):
 
 
 def _parse_yahoo_table(html: str):
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        raise ValueError("找不到 Yahoo 表格")
-
+    tables = _extract_tables_with_bs4(html)
     df, score = _pick_best_table(tables, ["股名", "股號", "股價", "漲跌", "漲跌幅", "最高", "最低", "成交量"])
     if df is None or score < 5:
         raise ValueError("Yahoo 表格結構不符預期")
 
-    df.columns = _flatten_columns(df.columns)
     name_code_col = _find_col(df, ["股名", "股號"]) or _find_col(df, ["股名"]) or _find_col(df, ["股號"])
     price_col = _find_col(df, ["股價"])
     change_col = _find_col(df, ["漲跌"])
@@ -285,31 +477,26 @@ def _parse_yahoo_table(html: str):
     out = df[[name_code_col, price_col, change_col, pct_col, high_col, low_col, vol_col]].copy()
     out.columns = ["name_code", "last", "chg", "chg_pct", "high", "low", "vol_lots"]
     out["code"] = out["name_code"].astype(str).str.extract(r"([0-9]{4,6}[A-Z]?)\.(?:TW|TWO)", expand=False)
-    out["name"] = out["name_code"].astype(str).str.replace(r"([0-9]{4,6}[A-Z]?)\.(?:TW|TWO)", "", regex=True)
-    out["name"] = out["name"].apply(_clean_name)
+    out["name"] = out["name_code"].astype(str).str.replace(r"([0-9]{4,6}[A-Z]?)\.(?:TW|TWO)", "", regex=True).apply(_clean_name)
 
     for c in ["last", "chg", "chg_pct", "high", "low", "vol_lots"]:
         out[c] = out[c].apply(_to_float)
-
+    out["prev_close"] = out["last"] - out["chg"]
+    out["market"] = ""
     out = out.dropna(subset=["code", "last", "high", "low", "vol_lots"])
     out = out[out["last"] > 0].copy()
 
     m = re.search(r"資料時間[:：]?\s*(\d{4}/\d{2}/\d{2}(?:\s+\d{2}:\d{2})?)", html)
     asof = m.group(1) if m else ""
-    out["prev_close"] = math.nan
-    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close"]].reset_index(drop=True), asof
+    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close", "market"]].reset_index(drop=True), asof
 
 
 def _parse_histock_table(html: str):
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        raise ValueError("找不到 HiStock 表格")
-
+    tables = _extract_tables_with_bs4(html)
     df, score = _pick_best_table(tables, ["代號", "名稱", "價格", "漲跌", "漲跌幅", "最高", "最低", "昨收", "成交量"])
     if df is None or score < 6:
         raise ValueError("HiStock 表格結構不符預期")
 
-    df.columns = _flatten_columns(df.columns)
     code_col = _find_col(df, ["代號"])
     name_col = _find_col(df, ["名稱"])
     price_col = _find_col(df, ["價格"])
@@ -339,84 +526,72 @@ def _parse_histock_table(html: str):
         rename_map[prev_col] = "prev_close"
     out = out.rename(columns=rename_map)
 
-    out["code"] = out["code"].astype(str).str.extract(r"([0-9]{4,6}[A-Z]?)", expand=False)
+    out["code"] = out["code"].apply(_normalize_code)
     out["name"] = out["name"].apply(_clean_name)
     for c in ["last", "chg_pct", "high", "low", "vol_lots"]:
         out[c] = out[c].apply(_to_float)
-    if "chg" in out.columns:
-        out["chg"] = out["chg"].apply(_to_float)
-    else:
-        out["chg"] = math.nan
-    if "prev_close" in out.columns:
-        out["prev_close"] = out["prev_close"].apply(_to_float)
-    else:
-        out["prev_close"] = math.nan
-
+    out["chg"] = out.get("chg", pd.Series([math.nan] * len(out))).apply(_to_float)
+    out["prev_close"] = out.get("prev_close", pd.Series([math.nan] * len(out))).apply(_to_float)
     need_change = out["chg"].isna() & out["prev_close"].notna() & out["last"].notna()
     out.loc[need_change, "chg"] = out.loc[need_change, "last"] - out.loc[need_change, "prev_close"]
-
+    out["market"] = ""
     out = out.dropna(subset=["code", "last", "high", "low", "vol_lots"])
     out = out[out["last"] > 0].copy()
 
     date_m = re.search(r"(\d{2}-\d{2})\s+Top", html)
     time_m = re.search(r"本地時間[:：]\s*(\d{1,2}:\d{2})", html)
-    asof = ""
-    if date_m and time_m:
-        asof = f"{date_m.group(1)} {time_m.group(1)}"
-    elif time_m:
-        asof = time_m.group(1)
-    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close"]].reset_index(drop=True), asof
+    asof = f"{date_m.group(1)} {time_m.group(1)}" if date_m and time_m else (time_m.group(1) if time_m else "")
+    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close", "market"]].reset_index(drop=True), asof
 
 
 def _parse_wantgoo_table(html: str):
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        raise ValueError("找不到 WantGoo 表格")
-
+    tables = _extract_tables_with_bs4(html)
     df, score = _pick_best_table(tables, ["代碼", "股票", "成交價", "最高", "最低", "成交量"])
     if df is None or score < 4:
         raise ValueError("WantGoo 表格結構不符預期")
 
-    df.columns = _flatten_columns(df.columns)
     code_col = _find_col(df, ["代碼"])
     name_col = _find_col(df, ["股票"])
     price_col = _find_col(df, ["成交價"])
     change_col = _find_col(df, ["漲跌"])
-    pct_col = _find_col(df, ["漲跌%"])
+    pct_col = _find_col(df, ["漲跌"])
     high_col = _find_col(df, ["最高"])
     low_col = _find_col(df, ["最低"])
     vol_col = _find_col(df, ["成交量"])
-    needed = [code_col, name_col, price_col, change_col, pct_col, high_col, low_col, vol_col]
+    needed = [code_col, name_col, price_col, change_col, high_col, low_col, vol_col]
     if any(c is None for c in needed):
         raise ValueError(f"WantGoo 欄位不足: {df.columns.tolist()}")
 
-    out = df[[code_col, name_col, price_col, change_col, pct_col, high_col, low_col, vol_col]].copy()
-    out.columns = ["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots"]
-    out["code"] = out["code"].astype(str).str.extract(r"([0-9]{4,6}[A-Z]?)", expand=False)
+    out = df[[code_col, name_col, price_col, change_col, high_col, low_col, vol_col]].copy()
+    out.columns = ["code", "name", "last", "chg", "high", "low", "vol_lots"]
+    out["code"] = out["code"].apply(_normalize_code)
     out["name"] = out["name"].apply(_clean_name)
-    for c in ["last", "chg", "chg_pct", "high", "low", "vol_lots"]:
+    for c in ["last", "chg", "high", "low", "vol_lots"]:
         out[c] = out[c].apply(_to_float)
+    out["prev_close"] = out["last"] - out["chg"]
+    out["chg_pct"] = ((_safe_pct(1, 1)) * 0.0)
+    out["chg_pct"] = out.apply(lambda r: (_safe_pct(r["last"] - r["prev_close"], r["prev_close"]) * 100) if pd.notna(r["prev_close"]) and r["prev_close"] > 0 else math.nan, axis=1)
+    out["market"] = ""
     out = out.dropna(subset=["code", "last", "high", "low", "vol_lots"])
     out = out[out["last"] > 0].copy()
 
-    m = re.search(r"(\d{4}/\d{2}/\d{2})", html)
+    m = re.search(r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})", html)
     asof = m.group(1) if m else ""
-    out["prev_close"] = math.nan
-    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close"]].reset_index(drop=True), asof
+    return out[["code", "name", "last", "chg", "chg_pct", "high", "low", "vol_lots", "prev_close", "market"]].reset_index(drop=True), asof
 
 
 @st.cache_data(ttl=RANK_CACHE_TTL, show_spinner=False)
 def _fetch_rank_html(url: str):
-    session = make_retry_session(base_headers=get_rank_headers(url))
+    session = make_retry_session(base_headers=get_browser_headers(url))
     r = safe_get(session, url, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return r.text
 
 
 @st.cache_data(ttl=RANK_CACHE_TTL, show_spinner=False)
-def fetch_rank_candidates(max_rows: int = 250):
+def fetch_html_fallback_snapshot(max_rows: int = 300):
     errors = []
-    for spec in RANK_SOURCES:
+    for spec in HTML_FALLBACK_SOURCES:
         try:
             html = _fetch_rank_html(spec["url"])
             if spec["kind"] == "yahoo":
@@ -426,101 +601,113 @@ def fetch_rank_candidates(max_rows: int = 250):
             else:
                 df, asof = _parse_wantgoo_table(html)
             if df is not None and not df.empty:
-                return df.head(max_rows), asof, spec["name"], errors
+                df = df.sort_values(["vol_lots", "chg_pct"], ascending=[False, False]).drop_duplicates("code", keep="first")
+                return df.head(max_rows).reset_index(drop=True), asof, spec["name"], errors
             errors.append(f"{spec['name']}: EMPTY")
         except Exception as e:
             errors.append(f"{spec['name']}: {type(e).__name__}: {e}")
-    raise RuntimeError(" | ".join(errors) if errors else "所有排行來源都失敗")
+    raise RuntimeError(" | ".join(errors) if errors else "HTML 備援來源全部失敗")
 
 
 # =========================
-# UI / THEME
+# SNAPSHOT ORCHESTRATION
 # =========================
-st.set_page_config(page_title="起漲戰情室 Ultra", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
-st.markdown(
-    """
-<style>
-    [data-testid="stAppViewContainer"], .main { background: #050505 !important; background-image: radial-gradient(circle at 15% 50%, rgba(20, 20, 20, 1), transparent 25%), radial-gradient(circle at 85% 30%, rgba(10, 25, 40, 0.8), transparent 25%) !important; color: #e2e8f0 !important; }
-    .block-container { padding-top: 2rem; max-width: 1280px; }
-    [data-testid="stSidebar"] { display: none !important; }
-    .title { font-size: 58px; font-weight: 900; letter-spacing: -2px; background: linear-gradient(135deg, #ffffff 0%, #718096 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-align: center; margin-bottom: 5px; }
-    .status-caption { color: #64748b; font-size: 13px; text-align: center; margin-bottom: 30px; letter-spacing: 1px;}
-    .pro-card { background: linear-gradient(145deg, rgba(22, 24, 29, 0.9), rgba(13, 15, 18, 0.9)); backdrop-filter: blur(24px); border: 1px solid rgba(255, 255, 255, 0.05); border-top: 1px solid rgba(255, 255, 255, 0.1); border-radius: 20px; padding: 24px; margin-bottom: 16px; transition: all 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5); }
-    .pro-card:hover { border-color: rgba(56, 189, 248, 0.4); transform: translateY(-5px) scale(1.01); box-shadow: 0 20px 40px -10px rgba(56, 189, 248, 0.15); }
-    .stock-name { font-size: 22px; font-weight: 800; color: #f8fafc; letter-spacing: 1px;}
-    .price-large { font-size: 36px; font-weight: 900; color: #ffffff; font-variant-numeric: tabular-nums; text-shadow: 0 2px 10px rgba(255,255,255,0.1);}
-    .tag-pro { padding: 5px 14px; border-radius: 6px; font-size: 11px; font-weight: 800; background: rgba(56, 189, 248, 0.1); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.2); letter-spacing: 1px;}
-    .fail-tag { display: inline-block; padding: 6px 12px; background: rgba(244, 63, 94, 0.05); color: #f43f5e; border-radius: 8px; margin: 4px; font-size: 12px; border: 1px solid rgba(244, 63, 94, 0.15); font-weight: 600;}
-    .stButton>button { border-radius: 16px !important; background: linear-gradient(135deg, #f8fafc 0%, #cbd5e1 100%) !important; color: #0f172a !important; font-weight: 900 !important; padding: 20px !important; width: 100% !important; border: none !important; font-size: 18px !important; letter-spacing: 2px !important; box-shadow: 0 4px 15px rgba(255,255,255,0.1) !important; transition: all 0.3s ease !important; }
-    .stButton>button:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(255,255,255,0.2) !important; }
-    [data-testid="stMetric"] { background: rgba(20,20,20,0.6); padding: 15px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.03); }
-    [data-testid="stMetricValue"] { font-size: 32px !important; font-weight: 900 !important; color: #f1f5f9 !important; }
-    [data-testid="stMetricLabel"] { font-size: 13px !important; color: #94a3b8 !important; font-weight: 600 !important; letter-spacing: 1px; }
-    [data-testid="stExpander"] { background: transparent !important; border: 1px solid rgba(255,255,255,0.05) !important; border-radius: 16px !important; }
-    [data-testid="stExpander"] summary { background: rgba(20,20,20,0.4) !important; border-radius: 16px !important; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# =========================
-# HELPERS
-# =========================
-def now_taipei():
-    return datetime.utcnow() + timedelta(hours=8)
+def market_phase(now_ts: datetime) -> str:
+    hhmm = now_ts.time()
+    if hhmm < dtime(9, 0):
+        return "pre"
+    if hhmm <= dtime(13, 45):
+        return "live"
+    return "post"
 
 
-def idx_date_taipei(idx):
+def merge_meta(base_meta: Dict[str, dict], source_df: pd.DataFrame) -> Dict[str, dict]:
+    meta = dict(base_meta or {})
+    if source_df is None or source_df.empty:
+        return meta
+    for _, r in source_df.iterrows():
+        code = str(r.get("code", "")).strip()
+        market = str(r.get("market", "")).strip().lower()
+        name = str(r.get("name", "")).strip() or code
+        if not code:
+            continue
+        if code not in meta and market in ("tse", "otc"):
+            meta[code] = {"name": name, "ex": market}
+        elif code in meta and not meta[code].get("name"):
+            meta[code]["name"] = name
+    return meta
+
+
+def enrich_market_from_meta(df: pd.DataFrame, meta_dict: Dict[str, dict]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    markets = []
+    names = []
+    for _, r in df.iterrows():
+        code = str(r.get("code", "")).strip()
+        info = meta_dict.get(code, {})
+        markets.append(info.get("ex", str(r.get("market", ""))))
+        names.append(info.get("name", str(r.get("name", code))))
+    df["market"] = markets
+    df["name"] = names
+    return df
+
+
+def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
+    now_ts = now_taipei()
+    phase = market_phase(now_ts)
+    diag["source_mode"] = "官方優先"
+    errors = []
+
+    # 盤後/盤前優先用官方收盤快照；盤中先試官方，若日期明顯落後再切 HTML live。
     try:
-        if getattr(idx, "tz", None) is not None:
+        status_placeholder.update(label="🏛️ 官方來源優先檢查中...", state="running")
+        official_df, official_asof, official_name, official_errors = fetch_official_combined_snapshot(320)
+        errors.extend(official_errors)
+        official_df = enrich_market_from_meta(official_df, merge_meta(meta_dict, official_df))
+        official_is_today = False
+        if official_asof:
             try:
-                return idx.tz_convert("Asia/Taipei").date
+                official_date = pd.to_datetime(str(official_asof).replace("/", "-"), errors="coerce")
+                official_is_today = pd.notna(official_date) and official_date.date() == now_ts.date()
             except Exception:
-                return idx.tz_localize(None).date
-    except Exception:
-        pass
-    return idx.date
+                official_is_today = False
 
-
-def tw_tick(price):
-    return 0.01 if price < 10 else 0.05 if price < 50 else 0.1 if price < 100 else 0.5 if price < 500 else 1.0 if price < 1000 else 5.0
-
-
-def calc_limit_up(prev_close, limit_pct=0.10):
-    raw = prev_close * (1.0 + limit_pct)
-    tick = tw_tick(raw)
-    n = math.floor((raw + 1e-12) / tick)
-    return round(n * tick, 2 if tick < 0.1 else 1 if tick < 1 else 0)
-
-
-def infer_daily_limit(pp, cp):
-    l10 = calc_limit_up(pp, 0.10)
-    l20 = calc_limit_up(pp, 0.20)
-    tol20 = max(tw_tick(l20), l20 * 0.0005)
-    if abs(cp - l20) <= tol20 and abs(cp - l20) < abs(cp - l10):
-        return l20
-    return l10
-
-
-# =========================
-# ENGINES
-# =========================
-def fetch_rank_snapshot(status_placeholder, diag):
-    status_placeholder.update(label="📡 抓取多來源成交量排行中...", state="running")
-    try:
-        raw_df, asof, src_name, fetch_errors = fetch_rank_candidates(max_rows=500)
-        diag["rank_asof"] = asof
-        diag["rank_source"] = src_name
-        for msg in fetch_errors:
-            diag_err(diag, Exception(msg), "RANK_FALLBACK")
-        diag["rank_seen"] = len(raw_df)
-        return raw_df
+        if phase != "live" or official_is_today:
+            diag["rank_source"] = official_name
+            diag["rank_asof"] = official_asof
+            return official_df
+        errors.append(f"官方日期較舊: {official_asof}")
     except Exception as e:
         diag["rank_req_err"] += 1
-        diag_err(diag, e, "RANK_FETCH")
-        return pd.DataFrame()
+        diag_err(diag, e, "OFFICIAL_FETCH")
+        errors.append(f"官方: {type(e).__name__}: {e}")
+
+    try:
+        status_placeholder.update(label="📡 盤中排行榜備援穿透中...", state="running")
+        html_df, html_asof, html_name, html_errors = fetch_html_fallback_snapshot(320)
+        errors.extend(html_errors)
+        html_df = enrich_market_from_meta(html_df, meta_dict)
+        if html_df is not None and not html_df.empty:
+            diag["rank_source"] = html_name
+            diag["rank_asof"] = html_asof
+            diag["source_mode"] = "官方失敗 / HTML備援"
+            return html_df
+    except Exception as e:
+        diag["rank_req_err"] += 1
+        diag_err(diag, e, "HTML_FALLBACK")
+        errors.append(f"HTML備援: {type(e).__name__}: {e}")
+
+    diag["rank_source"] = "失敗"
+    for msg in errors[-5:]:
+        diag_err(diag, Exception(msg), "RANK_CHAIN")
+    return pd.DataFrame()
 
 
+# =========================
+# CANDIDATE ENGINE
+# =========================
 def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
     rows = []
     diag["rank_seen"] = len(raw_df)
@@ -531,15 +718,14 @@ def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
 
     m = int((datetime.combine(now_ts.date(), now_ts.time()) - datetime.combine(now_ts.date(), dtime(9, 0))).total_seconds() // 60)
     m = max(0, min(270, m))
-    dist_limit = 6.0 if is_test else (4.2 if m <= 60 else 3.0 if m <= 180 else 2.2)
-    vol_limit_lots = 200 if is_test else 3000
+    dist_limit = 6.0 if is_test else (4.6 if m <= 60 else 3.2 if m <= 180 else 2.4)
+    vol_limit_lots = 200 if is_test else 2500
     chg_pct_min = -0.5 if is_test else 0.3
 
     for _, q in raw_df.iterrows():
-        c = str(q["code"]).strip()
+        c = str(q.get("code", "")).strip()
         if c not in meta_dict:
             continue
-
         try:
             last = float(q["last"])
             high = float(q["high"])
@@ -547,7 +733,6 @@ def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
             vol_lots = float(q["vol_lots"])
             chg = float(q["chg"]) if pd.notna(q["chg"]) else 0.0
             chg_pct = float(q["chg_pct"]) if pd.notna(q["chg_pct"]) else 0.0
-
             prev_from_src = float(q["prev_close"]) if ("prev_close" in q and pd.notna(q["prev_close"])) else math.nan
             prev_close = prev_from_src if math.isfinite(prev_from_src) and prev_from_src > 0 else round(last - chg, 2)
             if prev_close <= 0:
@@ -556,7 +741,6 @@ def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
 
             upper = calc_limit_up(prev_close, 0.10)
             dist_pct = max(0.0, ((upper - last) / upper) * 100)
-
             if vol_lots >= vol_limit_lots and dist_pct <= dist_limit and chg_pct >= chg_pct_min:
                 rows.append({
                     "code": c,
@@ -577,48 +761,10 @@ def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        df = df.sort_values(["dist", "vol_sh"], ascending=[True, False]).drop_duplicates("code", keep="first")
-
+        df = df.sort_values(["dist", "vol_sh", "chg_pct"], ascending=[True, False, False]).drop_duplicates("code", keep="first")
     diag["rank_rows"] = len(df)
     diag["cand_total"] = len(df)
     return df
-
-
-def make_snapshot_diag(meta_count, fetch_diag):
-    diag = diag_init()
-    diag["meta_count"] = meta_count
-    diag["rank_req_err"] = fetch_diag.get("rank_req_err", 0)
-    diag["rank_seen"] = fetch_diag.get("rank_seen", 0)
-    diag["rank_source"] = fetch_diag.get("rank_source", "-")
-    diag["rank_asof"] = fetch_diag.get("rank_asof", "")
-    diag["last_errors"] = deque(fetch_diag.get("last_errors", []), maxlen=10)
-    diag["t_meta"] = fetch_diag.get("t_meta", 0.0)
-    diag["t_rank"] = fetch_diag.get("t_rank", 0.0)
-    return diag
-
-
-def recompute_from_snapshot(snapshot, is_test, use_bloodline):
-    t0 = time.perf_counter()
-    diag = make_snapshot_diag(snapshot["meta_count"], snapshot["fetch_diag"])
-    now_ts = snapshot["ts"]
-
-    pre_df = build_rank_candidates(snapshot["raw_rank_df"], snapshot["meta"], now_ts, is_test, diag)
-    t = time.perf_counter()
-    final_res, stats, yf_diag = core_filter_engine(pre_df, snapshot["meta"], now_ts, is_test, diag, use_bloodline)
-    diag["t_filter"] = time.perf_counter() - t
-    diag.update(yf_diag)
-    diag["total"] = time.perf_counter() - t0
-
-    return {
-        "res": final_res,
-        "stats": stats,
-        "diag": diag,
-        "ts": now_ts,
-        "is_test": is_test,
-        "use_bloodline": use_bloodline,
-        "snapshot": snapshot,
-        "instant_switch": True,
-    }
 
 
 def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloodline):
@@ -629,19 +775,15 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
 
     candidates_df = candidates_df.sort_values(["dist", "vol_sh"], ascending=[True, False]).head(80)
     stats["Total"] = len(candidates_df)
-    syms = [f"{c}.{'TW' if meta_dict[c]['ex'] == 'tse' else 'TWO'}" for c in candidates_df["code"]]
+    syms = [f"{c}.{'TW' if meta_dict[c]['ex'] == 'tse' else 'TWO'}" for c in candidates_df["code"] if c in meta_dict]
     yf_diag["yf_symbols"] = len(syms)
 
-    # yfinance 若未安裝，系統降級為「排行即時候選模式」：
-    # 保留排行來源的高/低/漲幅/接近漲停判斷，不做 20 日量均與連板血統。
-    if not HAS_YF:
-        diag_err(diag, Exception("yfinance not installed; fallback to rank-only mode"), "YF_MISSING")
+    if (not HAS_YF) or (not syms):
         diag["t_yf"] = 0.0
         results = []
         m = int((datetime.combine(now_ts.date(), now_ts.time()) - datetime.combine(now_ts.date(), dtime(9, 0))).total_seconds() // 60)
         m = max(0, min(270, m))
         pb_lim = 0.05 if is_test else (0.015 if m <= 90 else 0.006)
-
         for _, r in candidates_df.iterrows():
             c, name = r["code"], meta_dict[r["code"]]["name"]
             try:
@@ -652,17 +794,10 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
                 if rng > 0.1 and (r["last"] - r["low"]) / max(1e-9, rng) < (0.5 if is_test else 0.80):
                     stats["收盤太弱"].append(f"{c} {name}")
                     continue
-
                 near_limit = abs(r["last"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
                 high_is_limit = abs(r["high"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
-                if near_limit and high_is_limit and abs(r["last"] - r["high"]) <= max(tw_tick(r["last"]), r["last"] * 0.0005):
-                    status = "🔥 鎖價跡象"
-                elif near_limit:
-                    status = "🚀 漲停附近"
-                else:
-                    status = "⚡ 發動"
-
-                base_lots = 200.0 if is_test else 3000.0
+                status = "🔥 鎖價跡象" if near_limit and high_is_limit else ("🚀 漲停附近" if near_limit else "⚡ 發動")
+                base_lots = 200.0 if is_test else 2500.0
                 vol_score = max(0.1, min(99.9, (r["vol_sh"] / 1000.0) / base_lots))
                 results.append({
                     "代號": c,
@@ -677,7 +812,6 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
             except Exception as e:
                 yf_diag["other_err"] += 1
                 diag_err(diag, e, "FILTER_RANK_ONLY")
-
         res_df = pd.DataFrame(results)
         if not res_df.empty:
             res_df = res_df.sort_values(["漲幅%", "爆量"], ascending=[False, False])
@@ -693,114 +827,62 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
                 res_frames.append(None)
                 continue
             try:
-                res_frames.append(yf_download_daily(part))
+                res_frames.append(yf_download_daily(tuple(part), "180d"))
             except Exception as e:
                 diag_err(diag, e, "YF_PART_FAIL")
                 res_frames.append(None)
         return res_frames
 
     try:
-        raw_daily = yf_download_daily(syms)
+        raw_daily = yf_download_daily(tuple(syms), "180d")
         if raw_daily is None or getattr(raw_daily, "empty", False):
             raise Exception("YF_BULK_EMPTY")
         diag["yf_rescue_used"] = 0
     except Exception as e:
-        tag = "YF_BULK_EMPTY" if str(e) == "YF_BULK_EMPTY" else "YF_BULK_FAIL"
-        diag_err(diag, e, tag)
-        diag["yf_bulk_fail"] = diag.get("yf_bulk_fail", 0) + 1
+        diag_err(diag, e, "YF_BULK_FAIL")
+        diag["yf_bulk_fail"] += 1
         diag["yf_rescue_used"] = 1
-
         mid = max(1, len(syms) // 2)
-        parts1 = [syms[:mid], syms[mid:]]
-        frames1 = try_yf_parts(parts1)
-
-        diag["yf_parts_ok"] = diag.get("yf_parts_ok", 0) + sum(1 for f in frames1 if f is not None and not getattr(f, "empty", False))
-        diag["yf_parts_fail"] = diag.get("yf_parts_fail", 0) + sum(1 for f in frames1 if f is None or getattr(f, "empty", False))
+        frames1 = try_yf_parts([syms[:mid], syms[mid:]])
+        diag["yf_parts_ok"] += sum(1 for f in frames1 if f is not None and not getattr(f, "empty", False))
+        diag["yf_parts_fail"] += sum(1 for f in frames1 if f is None or getattr(f, "empty", False))
         frames_ok = [f for f in frames1 if f is not None and not getattr(f, "empty", False)]
-
-        if len(frames_ok) < 2:
-            parts2 = []
-            for i, f in enumerate(frames1):
-                if f is None or getattr(f, "empty", False):
-                    p = parts1[i]
-                    if not p:
-                        continue
-                    if len(p) > 1:
-                        m2 = len(p) // 2
-                        parts2.extend([p[:m2], p[m2:]])
-                    else:
-                        parts2.append(p)
-
-            if parts2:
-                frames2 = try_yf_parts(parts2)
-                diag["yf_parts_ok"] += sum(1 for f in frames2 if f is not None and not getattr(f, "empty", False))
-                diag["yf_parts_fail"] += sum(1 for f in frames2 if f is None or getattr(f, "empty", False))
-                frames_ok.extend([f for f in frames2 if f is not None and not getattr(f, "empty", False)])
-
         if frames_ok:
             raw_daily = pd.concat(frames_ok, axis=1)
-            if raw_daily is not None and not isinstance(raw_daily.columns, pd.MultiIndex):
-                fallback_t = syms[0]
-                try:
-                    for f in frames_ok:
-                        if f is not None and isinstance(getattr(f, "columns", None), pd.MultiIndex):
-                            fallback_t = f.columns.get_level_values(0)[0]
-                            break
-                except Exception:
-                    pass
-                raw_daily.columns = pd.MultiIndex.from_product([[fallback_t], raw_daily.columns])
-            if isinstance(raw_daily.columns, pd.MultiIndex):
-                raw_daily = raw_daily.loc[:, ~raw_daily.columns.duplicated()]
-            raw_daily = raw_daily[~raw_daily.index.duplicated(keep="last")]
-            raw_daily = raw_daily.sort_index()
+            if not isinstance(raw_daily.columns, pd.MultiIndex):
+                raw_daily.columns = pd.MultiIndex.from_product([[syms[0]], raw_daily.columns])
+            raw_daily = raw_daily.loc[:, ~raw_daily.columns.duplicated()]
+            raw_daily = raw_daily[~raw_daily.index.duplicated(keep="last")].sort_index()
 
     diag["t_yf"] = time.perf_counter() - t_yf_start
     if raw_daily is None or getattr(raw_daily, "empty", False):
         yf_diag["other_err"] += 1
         return pd.DataFrame(), stats, yf_diag
 
-    if isinstance(raw_daily.columns, pd.MultiIndex):
-        diag["yf_returned"] = int(raw_daily.columns.get_level_values(0).nunique())
-    else:
-        diag["yf_returned"] = 1
-
+    diag["yf_returned"] = int(raw_daily.columns.get_level_values(0).nunique()) if isinstance(raw_daily.columns, pd.MultiIndex) else 1
     results, today_date = [], now_ts.date()
     m = int((datetime.combine(now_ts.date(), now_ts.time()) - datetime.combine(now_ts.date(), dtime(9, 0))).total_seconds() // 60)
     m = max(0, min(270, m))
-    frac = 0.5 if is_test else (
-        0.12 if m <= 30 else
-        0.12 + (0.5 - 0.12) * ((m - 30) / 90.0) if m <= 120 else
-        min(1.0, 0.5 + (1.0 - 0.5) * ((m - 120) / 150.0))
-    )
+    frac = 0.5 if is_test else (0.12 if m <= 30 else 0.12 + (0.5 - 0.12) * ((m - 30) / 90.0) if m <= 120 else min(1.0, 0.5 + (1.0 - 0.5) * ((m - 120) / 150.0)))
     pb_lim = 0.05 if is_test else (0.015 if m <= 90 else 0.006)
 
     for _, r in candidates_df.iterrows():
         c, name = r["code"], meta_dict[r["code"]]["name"]
         sym = f"{c}.{'TW' if meta_dict[c]['ex'] == 'tse' else 'TWO'}"
         try:
-            if isinstance(raw_daily.columns, pd.MultiIndex):
-                if sym not in raw_daily.columns.get_level_values(0):
-                    yf_diag["yf_fail"] += 1
-                    continue
-                df_sym = raw_daily[sym]
-            else:
-                df_sym = raw_daily
-
+            df_sym = raw_daily[sym] if isinstance(raw_daily.columns, pd.MultiIndex) and sym in raw_daily.columns.get_level_values(0) else raw_daily
             if not {"Close", "Volume"}.issubset(set(df_sym.columns)):
                 yf_diag["yf_fail"] += 1
                 continue
-
             dfD = df_sym[["Close", "Volume"]].dropna()
             if len(dfD) < 30:
                 yf_diag["yf_fail"] += 1
                 continue
-
             dates_tw = idx_date_taipei(dfD.index)
             past_df = dfD[dates_tw < today_date].copy()
             if len(past_df) < 30:
                 yf_diag["yf_fail"] += 1
                 continue
-
             vol_ma20_sh = float(past_df["Volume"].rolling(20).mean().iloc[-1])
             if (not math.isfinite(vol_ma20_sh)) or vol_ma20_sh <= 0:
                 yf_diag["yf_fail"] += 1
@@ -814,16 +896,13 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
                     past_boards += 1
                 else:
                     break
-
             if use_bloodline and (not is_test) and past_boards < 1:
                 stats["非連板標的"].append(f"{c} {name}")
                 continue
-
             vol_ratio = r["vol_sh"] / (vol_ma20_sh * frac + 1e-9)
             if vol_ratio < (0.5 if is_test else 1.3):
                 stats["爆量不足"].append(f"{c} {name}")
                 continue
-
             rng = max(0.0, r["high"] - r["low"])
             if (r["high"] - r["last"]) / max(1e-9, r["high"]) > pb_lim:
                 stats["回落過大"].append(f"{c} {name}")
@@ -831,16 +910,9 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
             if rng > 0.1 and (r["last"] - r["low"]) / max(1e-9, rng) < (0.5 if is_test else 0.80):
                 stats["收盤太弱"].append(f"{c} {name}")
                 continue
-
             near_limit = abs(r["last"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
             high_is_limit = abs(r["high"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
-            if near_limit and high_is_limit and abs(r["last"] - r["high"]) <= max(tw_tick(r["last"]), r["last"] * 0.0005):
-                status = "🔥 鎖價跡象"
-            elif near_limit:
-                status = "🚀 漲停附近"
-            else:
-                status = "⚡ 發動"
-
+            status = "🔥 鎖價跡象" if near_limit and high_is_limit and abs(r["last"] - r["high"]) <= max(tw_tick(r["last"]), r["last"] * 0.0005) else ("🚀 漲停附近" if near_limit else "⚡ 發動")
             results.append({
                 "代號": c,
                 "名稱": name,
@@ -862,61 +934,311 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
 
 
 # =========================
-# MAIN
+# CALIBRATION / QUALITY REVIEW
 # =========================
-st.markdown('<div class="title">起漲戰情室 ULTRA</div>', unsafe_allow_html=True)
-st.markdown('<div class="status-caption">排行候選池 v8.5｜切換即時套用｜多來源 fallback｜可無 YF 降級</div>', unsafe_allow_html=True)
+def _future_max_return(series_high: pd.Series, series_close: pd.Series, horizon: int) -> pd.Series:
+    future_highs = [series_high.shift(-i) for i in range(1, horizon + 1)]
+    if not future_highs:
+        return pd.Series(index=series_close.index, dtype=float)
+    max_future = pd.concat(future_highs, axis=1).max(axis=1)
+    return max_future / series_close - 1.0
+
+
+@st.cache_data(ttl=YF_CACHE_TTL, show_spinner=False)
+def calibrate_signal_quality(symbols: Tuple[str, ...], lookback_days: int = CALIBRATION_LOOKBACK_DAYS):
+    if (not HAS_YF) or (not symbols):
+        return {"status": "skip", "reason": "yfinance unavailable or no symbols"}
+    raw = yf_download_daily(symbols, f"{max(lookback_days + 60, 240)}d")
+    if raw is None or getattr(raw, "empty", False):
+        return {"status": "empty", "reason": "no yfinance data"}
+
+    records = []
+    for sym in symbols:
+        if isinstance(raw.columns, pd.MultiIndex):
+            if sym not in raw.columns.get_level_values(0):
+                continue
+            df = raw[sym].copy()
+        else:
+            df = raw.copy()
+        if not {"Open", "High", "Low", "Close", "Volume"}.issubset(df.columns):
+            continue
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+        if len(df) < 60:
+            continue
+        df = df.tail(max(lookback_days + 20, 120)).copy()
+        df["prev_close"] = df["Close"].shift(1)
+        df["vol_ma20"] = df["Volume"].rolling(20).mean()
+        df["range"] = (df["High"] - df["Low"]).clip(lower=0)
+        df["pos_in_range"] = (df["Close"] - df["Low"]) / df["range"].replace(0, math.nan)
+        df["upper"] = df["prev_close"].apply(lambda x: calc_limit_up(float(x), 0.10) if pd.notna(x) and x > 0 else math.nan)
+        df["tick"] = df["upper"].apply(lambda x: tw_tick(float(x)) if pd.notna(x) and x > 0 else math.nan)
+        df["near_limit"] = (df["Close"] >= (df["upper"] - df["tick"] * 1.2))
+        df["signal"] = (
+            df["prev_close"].gt(0)
+            & df["vol_ma20"].gt(0)
+            & df["Volume"].ge(df["vol_ma20"] * 1.6)
+            & df["near_limit"].fillna(False)
+            & df["pos_in_range"].ge(0.72)
+        )
+        df["ret_1d"] = df["Close"].shift(-1) / df["Close"] - 1.0
+        df["ret_3d"] = df["Close"].shift(-3) / df["Close"] - 1.0
+        df["ret_5d"] = df["Close"].shift(-5) / df["Close"] - 1.0
+        df["max_3d"] = _future_max_return(df["High"], df["Close"], 3)
+        df["max_5d"] = _future_max_return(df["High"], df["Close"], 5)
+        hits = df[df["signal"]].copy()
+        if hits.empty:
+            continue
+        hits["symbol"] = sym
+        records.append(hits[["symbol", "ret_1d", "ret_3d", "ret_5d", "max_3d", "max_5d"]])
+
+    if not records:
+        return {"status": "empty", "reason": "no historical signals"}
+
+    all_hits = pd.concat(records, ignore_index=True)
+    all_hits = all_hits.dropna(subset=["ret_1d", "max_3d"])
+    if all_hits.empty:
+        return {"status": "empty", "reason": "signals have no forward data"}
+
+    summary = {
+        "status": "ok",
+        "signal_count": int(len(all_hits)),
+        "symbol_count": int(all_hits["symbol"].nunique()),
+        "avg_1d": float(all_hits["ret_1d"].mean() * 100),
+        "avg_3d": float(all_hits["ret_3d"].mean() * 100),
+        "avg_5d": float(all_hits["ret_5d"].mean() * 100),
+        "avg_max_3d": float(all_hits["max_3d"].mean() * 100),
+        "avg_max_5d": float(all_hits["max_5d"].mean() * 100),
+        "win_3d_gt3": float((all_hits["max_3d"] >= 0.03).mean() * 100),
+        "win_5d_gt5": float((all_hits["max_5d"] >= 0.05).mean() * 100),
+    }
+    if summary["signal_count"] >= 18 and summary["win_3d_gt3"] >= 55 and summary["avg_max_3d"] >= 4.0:
+        score = 9
+    elif summary["signal_count"] >= 12 and summary["win_3d_gt3"] >= 48 and summary["avg_max_3d"] >= 3.0:
+        score = 8
+    elif summary["signal_count"] >= 8 and summary["win_3d_gt3"] >= 42:
+        score = 7
+    elif summary["signal_count"] >= 5 and summary["win_3d_gt3"] >= 35:
+        score = 6
+    else:
+        score = 5
+    summary["score"] = score
+    return summary
+
+
+# =========================
+# SNAPSHOT RECOMPUTE
+# =========================
+def make_snapshot_diag(meta_count, fetch_diag):
+    diag = diag_init()
+    diag["meta_count"] = meta_count
+    for k, v in fetch_diag.items():
+        if k == "last_errors":
+            diag["last_errors"] = deque(v, maxlen=12)
+        else:
+            diag[k] = v
+    return diag
+
+
+def recompute_from_snapshot(snapshot, is_test, use_bloodline):
+    t0 = time.perf_counter()
+    diag = make_snapshot_diag(snapshot["meta_count"], snapshot["fetch_diag"])
+    now_ts = snapshot["ts"]
+    pre_df = build_rank_candidates(snapshot["raw_rank_df"], snapshot["meta"], now_ts, is_test, diag)
+    t = time.perf_counter()
+    final_res, stats, yf_diag = core_filter_engine(pre_df, snapshot["meta"], now_ts, is_test, diag, use_bloodline)
+    diag["t_filter"] = time.perf_counter() - t
+    diag.update(yf_diag)
+    diag["total"] = time.perf_counter() - t0
+    return {
+        "res": final_res,
+        "stats": stats,
+        "diag": diag,
+        "ts": now_ts,
+        "is_test": is_test,
+        "use_bloodline": use_bloodline,
+        "snapshot": snapshot,
+        "instant_switch": True,
+    }
+
+
+# =========================
+# UI / THEME
+# =========================
+st.set_page_config(page_title="起漲戰情室 Ultra", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
+st.markdown(
+    """
+<style>
+:root {
+  --bg: #05070b;
+  --panel: rgba(13,16,22,.78);
+  --panel2: rgba(18,22,30,.9);
+  --line: rgba(255,255,255,.07);
+  --text: #edf2f7;
+  --muted: #8ea0b7;
+  --accent: #61dafb;
+  --accent2: #7c3aed;
+  --danger: #fb7185;
+  --ok: #34d399;
+}
+[data-testid="stAppViewContainer"], .main {
+  background:
+    radial-gradient(circle at 15% 15%, rgba(40,70,110,.26), transparent 22%),
+    radial-gradient(circle at 85% 25%, rgba(80,25,120,.23), transparent 24%),
+    linear-gradient(180deg, #04060a 0%, #05070b 55%, #020409 100%) !important;
+  color: var(--text) !important;
+}
+.block-container { max-width: 1380px; padding-top: 1.2rem; padding-bottom: 2rem; }
+[data-testid="stSidebar"] { display: none !important; }
+.hero-wrap {
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 28px;
+  padding: 28px 28px 22px 28px;
+  background: linear-gradient(145deg, rgba(15,18,25,.95), rgba(10,12,17,.78));
+  box-shadow: 0 18px 50px rgba(0,0,0,.28);
+  margin-bottom: 18px;
+}
+.title {
+  font-size: 64px; font-weight: 900; letter-spacing: -2.2px; line-height: 1;
+  background: linear-gradient(135deg,#ffffff 0%, #8fd3ff 35%, #b1a6ff 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.subtitle { color: var(--muted); font-size: 14px; margin-top: 8px; letter-spacing: .8px; }
+.hero-badges { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+.badge {
+  display:inline-flex; align-items:center; gap:8px; padding: 8px 14px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,.09); background: rgba(255,255,255,.03);
+  color: #d8e3f0; font-size: 12px; font-weight: 700;
+}
+.badge.blue { border-color: rgba(97,218,251,.18); color:#97e7ff; }
+.badge.green { border-color: rgba(52,211,153,.18); color:#7ef5c0; }
+.badge.purple { border-color: rgba(168,85,247,.18); color:#d0b3ff; }
+.glass {
+  background: linear-gradient(145deg, rgba(18,22,30,.9), rgba(12,16,22,.78));
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 22px;
+  padding: 18px;
+  box-shadow: 0 12px 30px rgba(0,0,0,.18);
+}
+.section-title { font-size: 18px; font-weight: 900; letter-spacing:.5px; margin-bottom: 10px; }
+.hint { color: var(--muted); font-size: 12px; }
+.pro-card {
+  background: linear-gradient(155deg, rgba(17,22,30,.95), rgba(10,13,18,.82));
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 24px;
+  padding: 22px;
+  min-height: 180px;
+  box-shadow: 0 16px 40px rgba(0,0,0,.22);
+}
+.pro-card:hover { border-color: rgba(97,218,251,.25); transform: translateY(-1px); }
+.stock-name { font-size: 21px; font-weight: 900; color: #f8fafc; letter-spacing: .4px; }
+.price-large { font-size: 38px; font-weight: 900; color: #fff; margin-top: 12px; }
+.tag-pro {
+  display:inline-block; padding:6px 12px; border-radius:10px; font-size:11px; font-weight:800;
+  background: rgba(97,218,251,.10); color: #7ddfff; border: 1px solid rgba(97,218,251,.16);
+}
+.fail-tag {
+  display:inline-block; padding: 7px 12px; background: rgba(251,113,133,.07); color: #ff9aad;
+  border-radius: 10px; margin: 4px; font-size: 12px; border: 1px solid rgba(251,113,133,.16); font-weight: 700;
+}
+.soft-line { height:1px; background: linear-gradient(90deg, transparent, rgba(255,255,255,.11), transparent); margin: 16px 0; }
+.stButton>button {
+  border-radius: 18px !important;
+  background: linear-gradient(135deg, #f8fafc 0%, #cfe2ff 48%, #e2d8ff 100%) !important;
+  color: #08111c !important;
+  font-weight: 900 !important;
+  padding: 18px 20px !important;
+  width: 100% !important;
+  border: none !important;
+  font-size: 18px !important;
+  letter-spacing: 1px !important;
+  box-shadow: 0 10px 24px rgba(120,170,255,.18) !important;
+}
+.stButton>button:hover { transform: translateY(-1px); }
+[data-testid="stMetric"] {
+  background: linear-gradient(145deg, rgba(16,20,27,.85), rgba(10,13,18,.7));
+  padding: 15px; border-radius: 18px; border: 1px solid rgba(255,255,255,.05);
+}
+[data-testid="stMetricLabel"] { color: #90a5bc !important; font-weight: 700 !important; }
+[data-testid="stMetricValue"] { font-weight: 900 !important; color: #f8fafc !important; }
+[data-testid="stExpander"] { border: 1px solid rgba(255,255,255,.06) !important; border-radius: 18px !important; overflow: hidden; }
+[data-testid="stExpander"] summary { background: rgba(13,16,22,.78) !important; }
+.top-note {
+  padding: 12px 14px; border-radius: 14px; background: rgba(97,218,251,.08); border: 1px solid rgba(97,218,251,.14);
+  color:#cfefff; font-size: 13px; font-weight: 700; margin-bottom: 12px;
+}
+.small-table {
+  width:100%; border-collapse: collapse; font-size: 13px; color:#e8eef8;
+}
+.small-table td, .small-table th { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,.06); text-align: left; }
+.small-table th { color:#9fb0c7; font-weight: 800; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    f'''
+<div class="hero-wrap">
+  <div class="title">起漲戰情室 ULTRA</div>
+  <div class="subtitle">v8.7｜官方 API 優先｜HTML 備援｜模式即時切換｜訊號校準 180 日</div>
+  <div class="hero-badges">
+    <span class="badge blue">🏛️ 官方優先</span>
+    <span class="badge green">⚡ 切換不重抓</span>
+    <span class="badge purple">🧪 校準 {CALIBRATION_LOOKBACK_DAYS} 日</span>
+    <span class="badge">🛡️ {'YF 可用' if HAS_YF else '無 YF 降級'}</span>
+  </div>
+</div>
+''',
+    unsafe_allow_html=True,
+)
 
 if not HAS_YF:
-    st.warning('⚠️ 目前環境未安裝 yfinance，系統已自動切換成「排行即時候選模式」。若要恢復血統/20日量均濾網，請在 requirements.txt 加入 yfinance。')
-    st.caption('🛡️ 連板血統在無 yfinance 模式下不生效，因此已自動停用。')
+    st.warning("⚠️ 目前環境未安裝 yfinance，系統會走『排行即時候選模式』。若要恢復 20 日量均 / 連板血統 / 訊號校準，請在 requirements.txt 加入 yfinance。")
 
-col_cfg = st.columns([1.2, 1.2, 1])
-with col_cfg[0]:
+cfg1, cfg2, cfg3 = st.columns([1.15, 1.15, 1.7])
+with cfg1:
     is_test = st.toggle("🔥 寬鬆測試模式", value=False)
-with col_cfg[1]:
+with cfg2:
     use_bloodline = st.toggle("🛡️ 嚴格連板血統", value=True, disabled=not HAS_YF)
-with col_cfg[2]:
-    st.caption("切換模式會直接套用上次快取，不重新掃描；重新掃描會抓最新網站資料")
+with cfg3:
+    st.markdown('<div class="top-note">切換模式只重算，不重抓。只有重新按掃描，才會重新向資料源取一次快照。</div>', unsafe_allow_html=True)
 
 now_time = time.time()
 last_run = st.session_state.get("last_run_ts", 0)
-cooldown_seconds = 15
+cooldown_seconds = 12
 
-if st.button("🚀 啟動排行縮圈掃描"):
+if st.button("🚀 啟動戰區掃描"):
     if now_time - last_run < cooldown_seconds:
-        st.warning(f"⏳ 系統冷卻防護中，請等待 {int(cooldown_seconds - (now_time - last_run))} 秒後再執行...")
+        st.warning(f"⏳ 系統冷卻中，請等待 {int(cooldown_seconds - (now_time - last_run))} 秒後再執行。")
     else:
         st.session_state["last_run_ts"] = now_time
         t0, diag = time.perf_counter(), diag_init()
-
         with st.status("⚡ 建立安全連線與解析市場中...", expanded=True) as status:
             t = time.perf_counter()
-            meta, meta_errs = get_stock_list()
+            base_meta, meta_errs = get_stock_list()
             diag["t_meta"] = time.perf_counter() - t
-            diag["meta_count"] = len(meta)
+            diag["meta_count"] = len(base_meta)
             for err in meta_errs:
                 diag_err(diag, Exception(err), "META_ERR")
-            if len(meta) < 500:
-                diag_err(diag, Exception(f"清單數量異常 ({len(meta)})"), "META_SUSPECT")
 
             t = time.perf_counter()
             now_ts = now_taipei()
-            raw_rank_df = fetch_rank_snapshot(status, diag)
+            raw_rank_df = fetch_rank_snapshot(status, diag, base_meta)
             diag["t_rank"] = time.perf_counter() - t
+            merged_meta = merge_meta(base_meta, raw_rank_df)
+            diag["meta_count"] = len(merged_meta)
 
-            pre_df = build_rank_candidates(raw_rank_df, meta, now_ts, is_test, diag)
-
+            pre_df = build_rank_candidates(raw_rank_df, merged_meta, now_ts, is_test, diag)
             t = time.perf_counter()
-            final_res, stats, yf_diag = core_filter_engine(pre_df, meta, now_ts, is_test, diag, use_bloodline)
+            final_res, stats, yf_diag = core_filter_engine(pre_df, merged_meta, now_ts, is_test, diag, use_bloodline)
             diag["t_filter"] = time.perf_counter() - t
             diag.update(yf_diag)
             diag["total"] = time.perf_counter() - t0
             status.update(label="✅ 掃描完成", state="complete")
 
         snapshot = {
-            "meta": meta,
-            "meta_count": len(meta),
+            "meta": merged_meta,
+            "meta_count": len(merged_meta),
             "raw_rank_df": raw_rank_df,
             "ts": now_ts,
             "fetch_diag": {
@@ -924,12 +1246,12 @@ if st.button("🚀 啟動排行縮圈掃描"):
                 "rank_seen": diag.get("rank_seen", 0),
                 "rank_source": diag.get("rank_source", "-"),
                 "rank_asof": diag.get("rank_asof", ""),
+                "source_mode": diag.get("source_mode", "-"),
                 "last_errors": list(diag.get("last_errors", [])),
                 "t_meta": diag.get("t_meta", 0.0),
                 "t_rank": diag.get("t_rank", 0.0),
             },
         }
-
         st.session_state["last_scan"] = {
             "res": final_res,
             "stats": stats,
@@ -951,33 +1273,57 @@ scan = st.session_state.get("last_scan")
 if scan:
     d, res, sts, ts = scan["diag"], scan["res"], scan["stats"], scan["ts"]
     t_str = f"測試: {'ON' if scan['is_test'] else 'OFF'} | 血統: {'ON' if scan['use_bloodline'] else 'OFF'}"
-    asof = f" | 排行日期：{d.get('rank_asof')}" if d.get("rank_asof") else ""
+    asof = f" | 快照：{d.get('rank_asof')}" if d.get("rank_asof") else ""
     st.markdown(
-        f'<div class="status-caption">上次更新：{ts.strftime("%H:%M:%S")} | {t_str}{asof} | 系統耗時：{d["total"]:.2f}s</div>',
+        f'<div class="hint" style="text-align:center; margin: 2px 0 18px 0;">上次更新：{ts.strftime("%H:%M:%S")} | {t_str}{asof} | 資料源：{d.get("rank_source", "-")} | 模式：{d.get("source_mode", "-")} | 耗時：{d.get("total", 0):.2f}s</div>',
         unsafe_allow_html=True,
     )
     if scan.get("instant_switch"):
-        st.caption("⚡ 本次為模式即時切換，直接套用上次掃描快取，未重新抓取網站。")
+        st.caption("⚡ 本次為模式即時切換，直接套用上次快取重算，未重新抓取網站。")
 
     m1, m2, m3, m4 = st.columns(4)
+    total_parse = d.get("rank_parse_ok", 0) + d.get("rank_parse_fail", 0)
     m1.metric("候選標的", d.get("cand_total", 0))
     m2.metric("嚴選錄取檔數", len(res))
-    total_parse = d.get("rank_parse_ok", 0) + d.get("rank_parse_fail", 0)
     m3.metric("排行解析良率", f"{(d.get('rank_parse_ok', 0) / max(1, total_parse) * 100):.1f}%")
     m4.metric("系統異常阻擋", d.get("rank_req_err", 0) + d.get("yf_fail", 0) + d.get("other_err", 0))
+
+    # Calibration panel
+    if HAS_YF:
+        cal_symbols = []
+        if not res.empty:
+            for _, rr in res.head(CALIBRATION_SYMBOL_CAP).iterrows():
+                code = str(rr["代號"])
+                if code in scan["snapshot"]["meta"]:
+                    ex = scan["snapshot"]["meta"][code]["ex"]
+                    cal_symbols.append(f"{code}.{'TW' if ex == 'tse' else 'TWO'}")
+        if cal_symbols:
+            t = time.perf_counter()
+            cal = calibrate_signal_quality(tuple(cal_symbols), CALIBRATION_LOOKBACK_DAYS)
+            d["t_cal"] = time.perf_counter() - t
+            st.markdown('<div class="glass" style="margin-top:16px; margin-bottom:16px;">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">🧪 訊號校準（近 180 日，現有強勢名單樣本）</div>', unsafe_allow_html=True)
+            if cal.get("status") == "ok":
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("校準分數", f"{cal['score']}/10")
+                c2.metric("樣本訊號數", cal["signal_count"])
+                c3.metric("3日最大均值", f"{cal['avg_max_3d']:.2f}%")
+                c4.metric("3日>3% 勝率", f"{cal['win_3d_gt3']:.1f}%")
+                c5.metric("5日>5% 勝率", f"{cal['win_5d_gt5']:.1f}%")
+                st.caption("這是『現有強勢股樣本』的歷史訊號校準，不是全市場完整事件回測；用途是檢查濾網方向有沒有明顯偏離。")
+            else:
+                st.caption(f"校準略過：{cal.get('reason', '-')}")
+            st.markdown('</div>', unsafe_allow_html=True)
 
     with st.expander("⚙️ 系統診斷與底層監控 (白盒分析)", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("股票主清單", d.get("meta_count", 0))
         c2.metric("排行有效解析", d.get("rank_parse_ok", 0))
-        st.caption(f"📡 資料源：{d.get('rank_source', '-')} | 候選池 {d.get('rank_rows', 0)} 檔 | Request ERR {d.get('rank_req_err', 0)}")
-        c3.metric("YF 數據覆蓋", '未安裝 / 降級' if not HAS_YF else f"{d.get('yf_returned', 0)} / {d.get('yf_symbols', 0)}")
+        c3.metric("YF 數據覆蓋", "未安裝 / 降級" if not HAS_YF else f"{d.get('yf_returned', 0)} / {d.get('yf_symbols', 0)}")
         rescue_msg = f"{'🟢 啟動' if d.get('yf_rescue_used', 0) else '⚪ 待命'} | ERR {d.get('other_err', 0)}"
         c4.metric("救援協議 / 錯誤", rescue_msg)
-        if d.get("yf_rescue_used", 0):
-            st.caption(f"⚠️ 細胞分裂救援：成功 {d.get('yf_parts_ok', 0)} 塊 / 失敗 {d.get('yf_parts_fail', 0)} 塊")
-
-        st.caption(f"耗時分布：Meta {d['t_meta']:.2f}s | Rank {d['t_rank']:.2f}s | YF {d.get('t_yf', 0):.2f}s | Filter {d['t_filter']:.2f}s")
+        st.caption(f"📡 來源：{d.get('rank_source', '-')} | 模式：{d.get('source_mode', '-')} | 候選池 {d.get('rank_rows', 0)} 檔 | Request ERR {d.get('rank_req_err', 0)}")
+        st.caption(f"耗時：Meta {d.get('t_meta',0):.2f}s | Rank {d.get('t_rank',0):.2f}s | YF {d.get('t_yf',0):.2f}s | Filter {d.get('t_filter',0):.2f}s | Cal {d.get('t_cal',0):.2f}s")
         if d.get("last_errors"):
             st.code("\n".join(d["last_errors"]))
 
@@ -985,27 +1331,30 @@ if scan:
         for reason, stocks in sts.items():
             if isinstance(stocks, list) and stocks:
                 st.markdown(f"**{reason}**")
-                st.markdown('<div>' + "".join([f'<span class="fail-tag">{s}</span>' for s in stocks]) + '</div>', unsafe_allow_html=True)
+                st.markdown('<div>' + ''.join([f'<span class="fail-tag">{s}</span>' for s in stocks]) + '</div>', unsafe_allow_html=True)
 
     if not res.empty:
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="soft-line"></div>', unsafe_allow_html=True)
         cols = st.columns(4)
         for i, r in res.iterrows():
             with cols[i % 4]:
                 st.markdown(
-                    f"""<div class="pro-card">
+                    f'''<div class="pro-card">
                         <div class="tag-pro">{r['階段']}</div>
                         <div class="stock-name">{r['代號']} {r['名稱']}</div>
-                        <div style="height:12px;"></div>
                         <div class="price-large">{r['現價']:.2f}</div>
-                        <div style="font-size:13px; color:#94a3b8; margin-top:12px; font-weight:600;">
-                            {r['狀態']} | 動能 {r['爆量']:.1f}x | 漲幅 {r['漲幅%']:.2f}%
-                        </div>
-                    </div>""",
+                        <div style="margin-top:12px; color:#9cb1c7; font-weight:700;">{r['狀態']}</div>
+                        <div style="margin-top:8px; color:#d6e6f4; font-size:14px;">動能 {r['爆量']:.1f}x ｜ 漲幅 {r['漲幅%']:.2f}%</div>
+                    </div>''',
                     unsafe_allow_html=True,
                 )
+        table_df = res[["代號", "名稱", "現價", "爆量", "狀態", "階段", "漲幅%"]].copy()
+        with st.expander("📋 嚴選名單明細表", expanded=False):
+            st.dataframe(table_df, use_container_width=True, hide_index=True)
     else:
         if d.get("rank_parse_ok", 0) == 0:
-            st.error("🚨 無法取得排行資料或解析失敗，請檢視診斷面板。")
+            st.error("🚨 本輪未成功取得可用排行快照。請先看白盒面板，確認官方或備援來源是否都失敗。")
         else:
-            st.warning("⚠️ 掃描完畢。目前排行候選池內無標的通過嚴格濾網。")
+            st.warning("⚠️ 掃描完畢，目前沒有標的通過你設定的濾網。")
+else:
+    st.info("先按『啟動戰區掃描』。這版會先試官方 API，再視盤中情況切 HTML 備援。")

@@ -1299,16 +1299,132 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     }
 
 
+
+
+@st.cache_data(ttl=RANK_CACHE_TTL, show_spinner=False)
+def _fetch_single_html(url: str):
+    session = make_retry_session(base_headers=get_browser_headers(url))
+    r = safe_get(session, url, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.text
+
+
+def _extract_single_code_candidates(query: str, snapshot: dict):
+    q = str(query or '').strip()
+    q_lower = q.lower()
+    meta = snapshot.get('meta', {}) or {}
+    cands = []
+    if re.fullmatch(r'[0-9]{4,6}[A-Z]?', q):
+        if q in meta:
+            cands.append((q, meta[q]))
+    for code, info in meta.items():
+        name = str(info.get('name', code))
+        if q == code or q_lower == name.lower() or q_lower in name.lower():
+            pair = (code, info)
+            if pair not in cands:
+                cands.append(pair)
+    return cands[:8]
+
+
+def _parse_single_wantgoo_quote(html: str, code: str, name: str, market: str):
+    text = re.sub(r'\s+', ' ', BeautifulSoup(html, 'html.parser').get_text(' ', strip=True))
+    pat = re.compile(
+        rf"{re.escape(name)}\({re.escape(code)}\).*?(\d{{4}}-\d{{2}}-\d{{2}}).*?([0-9]+(?:\.[0-9]+)?)\s+([+\-]?[0-9]+(?:\.[0-9]+)?)\s*\(([+\-]?[0-9]+(?:\.[0-9]+)?)%\).*?高\s*([0-9]+(?:\.[0-9]+)?)\s*低\s*([0-9]+(?:\.[0-9]+)?)\s*量\s*([0-9,]+(?:\.[0-9]+)?)",
+        re.I,
+    )
+    m = pat.search(text)
+    if not m:
+        raise ValueError('WantGoo 單股頁解析失敗')
+    asof, last, chg, chg_pct, high, low, vol = m.groups()
+    last = _to_float(last); chg = _to_float(chg); chg_pct = _to_float(chg_pct)
+    high = _to_float(high) or last; low = _to_float(low) or last; vol = _to_float(vol)
+    return {
+        'code': code, 'name': name, 'last': last, 'chg': chg, 'chg_pct': chg_pct,
+        'high': high, 'low': low, 'vol_lots': vol, 'prev_close': (last - chg) if pd.notna(chg) else math.nan,
+        'market': market, 'search_source': '單股補抓 WantGoo', 'stale_note': f'單股補抓 {asof}，非本輪排行池快照'
+    }
+
+
+def _parse_single_yahoo_quote(html: str, code: str, name: str, market: str):
+    text = re.sub(r'\s+', ' ', BeautifulSoup(html, 'html.parser').get_text(' ', strip=True))
+    pat = re.compile(
+        rf"{re.escape(name)}\s*{re.escape(code)}(?:\.TW|\.TWO)? .*?比較 .*?加入自選股 .*?([0-9]+(?:\.[0-9]+)?)\s*([+\-]?[0-9]+(?:\.[0-9]+)?)\s*\(([+\-]?[0-9]+(?:\.[0-9]+)?)%\)",
+        re.I,
+    )
+    m = pat.search(text)
+    if not m:
+        # 退一步，只抓代碼附近第一組 價/漲跌/漲跌幅
+        pat = re.compile(rf"{re.escape(code)}(?:\.TW|\.TWO)? .*?([0-9]+(?:\.[0-9]+)?)\s*([+\-]?[0-9]+(?:\.[0-9]+)?)\s*\(([+\-]?[0-9]+(?:\.[0-9]+)?)%\)", re.I)
+        m = pat.search(text)
+    if not m:
+        raise ValueError('Yahoo 單股頁解析失敗')
+    last, chg, chg_pct = m.groups()
+    last = _to_float(last); chg = _to_float(chg); chg_pct = _to_float(chg_pct)
+    vol = math.nan
+    for vp in [r'成交量\s*([0-9,]+(?:\.[0-9]+)?)', r'([0-9,]+(?:\.[0-9]+)?)\s*成交量']:
+        vm = re.search(vp, text)
+        if vm:
+            vol = _to_float(vm.group(1)); break
+    high = last; low = last
+    hm = re.search(r'最高\s*([0-9]+(?:\.[0-9]+)?)', text)
+    lm = re.search(r'最低\s*([0-9]+(?:\.[0-9]+)?)', text)
+    if hm: high = _to_float(hm.group(1)) or last
+    if lm: low = _to_float(lm.group(1)) or last
+    tm = re.search(r'(?:開盤|盤中|收盤)\s*\|\s*(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})\s*更新', text)
+    asof = tm.group(1) if tm else ''
+    note = f'單股補抓 {asof}，部分欄位可能為降級估值' if asof else '單股補抓，部分欄位可能為降級估值'
+    return {
+        'code': code, 'name': name, 'last': last, 'chg': chg, 'chg_pct': chg_pct,
+        'high': high, 'low': low, 'vol_lots': vol, 'prev_close': (last - chg) if pd.notna(chg) else math.nan,
+        'market': market, 'search_source': '單股補抓 Yahoo', 'stale_note': note
+    }
+
+
+def fetch_single_stock_row(query: str, snapshot: dict):
+    matches = []
+    for code, info in _extract_single_code_candidates(query, snapshot):
+        name = str(info.get('name', code)).strip() or code
+        market = str(info.get('ex', '')).strip().lower()
+        matches.append(f'{code} {name}')
+        yahoo_suffix = 'TW' if market == 'tse' else 'TWO'
+        sources = [
+            ('wantgoo', f'https://www.wantgoo.com/stock/{code}/technical-chart'),
+            ('yahoo', f'https://tw.stock.yahoo.com/quote/{code}.{yahoo_suffix}')
+        ]
+        errs = []
+        for kind, url in sources:
+            try:
+                html = _fetch_single_html(url)
+                if kind == 'wantgoo':
+                    return _parse_single_wantgoo_quote(html, code, name, market), matches, errs
+                return _parse_single_yahoo_quote(html, code, name, market), matches, errs
+            except Exception as e:
+                errs.append(f'{kind}: {type(e).__name__}: {e}')
+        if errs:
+            return None, matches, errs
+    return None, matches, []
+
 def recompute_single_search(search_state: dict, scan: dict, is_test: bool, use_bloodline: bool):
     query = str(search_state.get("query", "")).strip()
     if not query or not scan or not scan.get("snapshot"):
         return None
     row, matches = _resolve_search_row(query, scan["snapshot"])
+    fetch_errors = []
     if row is None:
-        return {"status": "miss", "query": query, "matches": matches, "is_test": is_test, "use_bloodline": use_bloodline, "ts": scan["ts"]}
+        single_row, single_matches, single_errors = fetch_single_stock_row(query, scan["snapshot"])
+        matches = matches or single_matches
+        fetch_errors = single_errors
+        row = single_row
+    if row is None:
+        return {
+            "status": "miss", "query": query, "matches": matches,
+            "fetch_errors": fetch_errors,
+            "is_test": is_test, "use_bloodline": use_bloodline, "ts": scan["ts"]
+        }
     report = evaluate_single_stock(row, scan["snapshot"]["meta"], scan["ts"], is_test, use_bloodline)
     report["query"] = query
     report["matches"] = matches
+    report["fetch_errors"] = fetch_errors
     report["is_test"] = is_test
     report["use_bloodline"] = use_bloodline
     report["ts"] = scan["ts"]
@@ -1608,9 +1724,11 @@ if scan:
                     st.caption("濾網警示：" + "、".join(sr["filter_flags"]))
                 st.caption(sr.get("vol_note", ""))
         elif search_report.get("status") == "miss":
-            st.warning("查無本輪可評估快照資料。")
+            st.warning("查無可評估資料；本輪排行池與單股補抓都沒有成功拿到可用快照。")
             if search_report.get("matches"):
                 st.caption("你可能想找：" + "｜".join(search_report["matches"]))
+            if search_report.get("fetch_errors"):
+                st.caption("單股補抓失敗：" + " | ".join(search_report["fetch_errors"][:3]))
         elif search_report.get("status") == "error":
             st.error(search_report.get("message", "單股評估失敗"))
     st.markdown('</div>', unsafe_allow_html=True)

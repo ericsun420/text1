@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+urllib3
+yfinance
+lxml
+html5lib
+beautifulsoup4

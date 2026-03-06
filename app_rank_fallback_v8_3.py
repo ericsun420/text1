@@ -3,6 +3,7 @@ import io
 import math
 import re
 import time
+import copy
 from datetime import datetime, timedelta, time as dtime
 from collections import deque
 
@@ -494,21 +495,29 @@ def infer_daily_limit(pp, cp):
 # =========================
 # ENGINES
 # =========================
-def rank_candidate_scan(meta_dict, status_placeholder, now_ts, is_test, diag):
-    rows = []
+def fetch_rank_snapshot(status_placeholder, diag):
     status_placeholder.update(label="📡 抓取多來源成交量排行中...", state="running")
     try:
-        raw_df, asof, src_name, fetch_errors = fetch_rank_candidates(max_rows=300 if not is_test else 500)
+        raw_df, asof, src_name, fetch_errors = fetch_rank_candidates(max_rows=500)
         diag["rank_asof"] = asof
         diag["rank_source"] = src_name
         for msg in fetch_errors:
             diag_err(diag, Exception(msg), "RANK_FALLBACK")
+        diag["rank_seen"] = len(raw_df)
+        return raw_df
     except Exception as e:
         diag["rank_req_err"] += 1
         diag_err(diag, e, "RANK_FETCH")
         return pd.DataFrame()
 
+
+def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
+    rows = []
     diag["rank_seen"] = len(raw_df)
+    diag["rank_parse_ok"] = 0
+    diag["rank_parse_fail"] = 0
+    diag["rank_rows"] = 0
+    diag["cand_total"] = 0
 
     m = int((datetime.combine(now_ts.date(), now_ts.time()) - datetime.combine(now_ts.date(), dtime(9, 0))).total_seconds() // 60)
     m = max(0, min(270, m))
@@ -562,6 +571,43 @@ def rank_candidate_scan(meta_dict, status_placeholder, now_ts, is_test, diag):
     diag["rank_rows"] = len(df)
     diag["cand_total"] = len(df)
     return df
+
+
+def make_snapshot_diag(meta_count, fetch_diag):
+    diag = diag_init()
+    diag["meta_count"] = meta_count
+    diag["rank_req_err"] = fetch_diag.get("rank_req_err", 0)
+    diag["rank_seen"] = fetch_diag.get("rank_seen", 0)
+    diag["rank_source"] = fetch_diag.get("rank_source", "-")
+    diag["rank_asof"] = fetch_diag.get("rank_asof", "")
+    diag["last_errors"] = deque(fetch_diag.get("last_errors", []), maxlen=10)
+    diag["t_meta"] = fetch_diag.get("t_meta", 0.0)
+    diag["t_rank"] = fetch_diag.get("t_rank", 0.0)
+    return diag
+
+
+def recompute_from_snapshot(snapshot, is_test, use_bloodline):
+    t0 = time.perf_counter()
+    diag = make_snapshot_diag(snapshot["meta_count"], snapshot["fetch_diag"])
+    now_ts = snapshot["ts"]
+
+    pre_df = build_rank_candidates(snapshot["raw_rank_df"], snapshot["meta"], now_ts, is_test, diag)
+    t = time.perf_counter()
+    final_res, stats, yf_diag = core_filter_engine(pre_df, snapshot["meta"], now_ts, is_test, diag, use_bloodline)
+    diag["t_filter"] = time.perf_counter() - t
+    diag.update(yf_diag)
+    diag["total"] = time.perf_counter() - t0
+
+    return {
+        "res": final_res,
+        "stats": stats,
+        "diag": diag,
+        "ts": now_ts,
+        "is_test": is_test,
+        "use_bloodline": use_bloodline,
+        "snapshot": snapshot,
+        "instant_switch": True,
+    }
 
 
 def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloodline):
@@ -807,7 +853,7 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
 # MAIN
 # =========================
 st.markdown('<div class="title">起漲戰情室 ULTRA</div>', unsafe_allow_html=True)
-st.markdown('<div class="status-caption">排行候選池 v8.4｜多來源 fallback｜可無 YF 降級</div>', unsafe_allow_html=True)
+st.markdown('<div class="status-caption">排行候選池 v8.5｜切換即時套用｜多來源 fallback｜可無 YF 降級</div>', unsafe_allow_html=True)
 
 if not HAS_YF:
     st.warning('⚠️ 目前環境未安裝 yfinance，系統已自動切換成「排行即時候選模式」。若要恢復血統/20日量均濾網，請在 requirements.txt 加入 yfinance。')
@@ -818,7 +864,7 @@ with col_cfg[0]:
 with col_cfg[1]:
     use_bloodline = st.toggle("🛡️ 嚴格連板血統", value=True)
 with col_cfg[2]:
-    st.caption("資料源：WantGoo 成交量排行")
+    st.caption("切換模式會直接套用上次快取，不重新掃描")
 
 now_time = time.time()
 last_run = st.session_state.get("last_run_ts", 0)
@@ -843,8 +889,10 @@ if st.button("🚀 啟動排行縮圈掃描"):
 
             t = time.perf_counter()
             now_ts = now_taipei()
-            pre_df = rank_candidate_scan(meta, status, now_ts, is_test, diag)
+            raw_rank_df = fetch_rank_snapshot(status, diag)
             diag["t_rank"] = time.perf_counter() - t
+
+            pre_df = build_rank_candidates(raw_rank_df, meta, now_ts, is_test, diag)
 
             t = time.perf_counter()
             final_res, stats, yf_diag = core_filter_engine(pre_df, meta, now_ts, is_test, diag, use_bloodline)
@@ -853,6 +901,22 @@ if st.button("🚀 啟動排行縮圈掃描"):
             diag["total"] = time.perf_counter() - t0
             status.update(label="✅ 掃描完成", state="complete")
 
+        snapshot = {
+            "meta": meta,
+            "meta_count": len(meta),
+            "raw_rank_df": raw_rank_df,
+            "ts": now_ts,
+            "fetch_diag": {
+                "rank_req_err": diag.get("rank_req_err", 0),
+                "rank_seen": diag.get("rank_seen", 0),
+                "rank_source": diag.get("rank_source", "-"),
+                "rank_asof": diag.get("rank_asof", ""),
+                "last_errors": list(diag.get("last_errors", [])),
+                "t_meta": diag.get("t_meta", 0.0),
+                "t_rank": diag.get("t_rank", 0.0),
+            },
+        }
+
         st.session_state["last_scan"] = {
             "res": final_res,
             "stats": stats,
@@ -860,8 +924,15 @@ if st.button("🚀 啟動排行縮圈掃描"):
             "ts": now_ts,
             "is_test": is_test,
             "use_bloodline": use_bloodline,
+            "snapshot": snapshot,
+            "instant_switch": False,
         }
         st.rerun()
+
+scan = st.session_state.get("last_scan")
+if scan and scan.get("snapshot") and (scan.get("is_test") != is_test or scan.get("use_bloodline") != use_bloodline):
+    st.session_state["last_scan"] = recompute_from_snapshot(scan["snapshot"], is_test, use_bloodline)
+    st.rerun()
 
 scan = st.session_state.get("last_scan")
 if scan:
@@ -872,6 +943,8 @@ if scan:
         f'<div class="status-caption">上次更新：{ts.strftime("%H:%M:%S")} | {t_str}{asof} | 系統耗時：{d["total"]:.2f}s</div>',
         unsafe_allow_html=True,
     )
+    if scan.get("instant_switch"):
+        st.caption("⚡ 本次為模式即時切換，直接套用上次掃描快取，未重新抓取網站。")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("候選標的", d.get("cand_total", 0))

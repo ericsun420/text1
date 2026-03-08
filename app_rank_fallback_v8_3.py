@@ -1,4 +1,4 @@
-# app.py — 起漲戰情室｜戰神 v8.7 官方API優先版｜多來源備援｜即時切換｜訊號校準
+# app.py — 股市熱門趨勢雷達｜掃描精靈 v8.7 官方API優先版｜多來源備援｜即時切換｜歷史準確度測試
 import html
 import io
 import math
@@ -402,7 +402,7 @@ def fetch_official_combined_snapshot(max_rows: int | None = 300):
     asof = roc_to_gregorian(tpex_asof) if tpex_asof else now_taipei().strftime("%Y/%m/%d")
     if max_rows is not None:
         df = df.head(max_rows)
-    return df.reset_index(drop=True), asof, "官方收盤快照(TWSE+TPEX)", errors
+    return df.reset_index(drop=True), asof, "官方每日資料(TWSE+TPEX)", errors
 
 
 # =========================
@@ -609,7 +609,7 @@ def fetch_html_fallback_snapshot(max_rows: int = 300):
             errors.append(f"{spec['name']}: EMPTY")
         except Exception as e:
             errors.append(f"{spec['name']}: {type(e).__name__}: {e}")
-    raise RuntimeError(" | ".join(errors) if errors else "HTML 備援來源全部失敗")
+    raise RuntimeError(" | ".join(errors) if errors else "備用網頁資料全部失敗")
 
 
 # =========================
@@ -660,14 +660,14 @@ def enrich_market_from_meta(df: pd.DataFrame, meta_dict: Dict[str, dict]) -> pd.
 def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
     now_ts = now_taipei()
     phase = market_phase(now_ts)
-    diag["source_mode"] = "官方優先"
+    diag["source_mode"] = "優先使用官方資料"
     errors = []
     official_backup_df = pd.DataFrame()
     official_backup_asof = ""
 
     # 盤後/盤前優先用官方收盤快照；盤中先試官方，若日期明顯落後再切 HTML live。
     try:
-        status_placeholder.update(label="🏛️ 官方來源優先檢查中...", state="running")
+        status_placeholder.update(label="🏛️ 正在檢查官方資料庫...", state="running")
         official_df, official_asof, official_name, official_errors = fetch_official_combined_snapshot(None)
         errors.extend(official_errors)
         official_df = enrich_market_from_meta(official_df, merge_meta(meta_dict, official_df))
@@ -689,24 +689,24 @@ def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
     except Exception as e:
         diag["rank_req_err"] += 1
         diag_err(diag, e, "OFFICIAL_FETCH")
-        errors.append(f"官方: {type(e).__name__}: {e}")
+        errors.append(f"官方資料錯誤: {type(e).__name__}: {e}")
 
     try:
-        status_placeholder.update(label="📡 盤中排行榜備援穿透中...", state="running")
+        status_placeholder.update(label="📡 官方沒資料，啟動備用網頁抓取...", state="running")
         html_df, html_asof, html_name, html_errors = fetch_html_fallback_snapshot(320)
         errors.extend(html_errors)
         html_df = enrich_market_from_meta(html_df, meta_dict)
         if html_df is not None and not html_df.empty:
             diag["rank_source"] = html_name
             diag["rank_asof"] = html_asof
-            diag["source_mode"] = "官方失敗 / HTML備援"
+            diag["source_mode"] = "官方失敗 / 改用網頁備用資料"
             return html_df, official_backup_df, official_backup_asof
     except Exception as e:
         diag["rank_req_err"] += 1
         diag_err(diag, e, "HTML_FALLBACK")
-        errors.append(f"HTML備援: {type(e).__name__}: {e}")
+        errors.append(f"網頁備用失敗: {type(e).__name__}: {e}")
 
-    diag["rank_source"] = "失敗"
+    diag["rank_source"] = "全部失敗"
     for msg in errors[-5:]:
         diag_err(diag, Exception(msg), "RANK_CHAIN")
     return pd.DataFrame(), official_backup_df, official_backup_asof
@@ -775,13 +775,13 @@ def build_rank_candidates(raw_df, meta_dict, now_ts, is_test, diag):
 
 
 def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloodline):
-    stats = {"Total": 0, "爆量不足": [], "回落過大": [], "收盤太弱": [], "非連板標的": []}
+    stats = {"總共測試檔數": 0, "交易熱度不夠": [], "從高點跌落太多": [], "最後沒力氣維持高價": [], "過去沒有連續大漲紀錄": []}
     yf_diag = {"yf_symbols": 0, "yf_fail": 0, "other_err": 0}
     if candidates_df.empty:
         return pd.DataFrame(), stats, yf_diag
 
     candidates_df = candidates_df.sort_values(["dist", "vol_sh"], ascending=[True, False]).head(80)
-    stats["Total"] = len(candidates_df)
+    stats["總共測試檔數"] = len(candidates_df)
     syms = [f"{c}.{'TW' if meta_dict[c]['ex'] == 'tse' else 'TWO'}" for c in candidates_df["code"] if c in meta_dict]
     yf_diag["yf_symbols"] = len(syms)
 
@@ -796,32 +796,32 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
             try:
                 rng = max(0.0, r["high"] - r["low"])
                 if (r["high"] - r["last"]) / max(1e-9, r["high"]) > pb_lim:
-                    stats["回落過大"].append(f"{c} {name}")
+                    stats["從高點跌落太多"].append(f"{c} {name}")
                     continue
                 if rng > 0.1 and (r["last"] - r["low"]) / max(1e-9, rng) < (0.5 if is_test else 0.80):
-                    stats["收盤太弱"].append(f"{c} {name}")
+                    stats["最後沒力氣維持高價"].append(f"{c} {name}")
                     continue
                 near_limit = abs(r["last"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
                 high_is_limit = abs(r["high"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
-                status = "🔥 鎖價跡象" if near_limit and high_is_limit else ("🚀 漲停附近" if near_limit else "⚡ 發動")
+                status = "🔥 漲到頂點 (難買到)" if near_limit and high_is_limit else ("🚀 快要漲到最高限額了" if near_limit else "⚡ 開始衝刺")
                 base_lots = 200.0 if is_test else 2500.0
                 vol_score = max(0.1, min(99.9, (r["vol_sh"] / 1000.0) / base_lots))
                 results.append({
                     "代號": c,
                     "名稱": name,
-                    "現價": r["last"],
-                    "爆量": vol_score,
-                    "狀態": status + "（降級）",
-                    "階段": "排行候選",
+                    "目前價格": r["last"],
+                    "交易熱度": vol_score,
+                    "狀態": status + "（標準放寬）",
+                    "階段": "初步入選",
                     "board_val": 0,
-                    "漲幅%": r.get("chg_pct", 0.0),
+                    "上漲幅度%": r.get("chg_pct", 0.0),
                 })
             except Exception as e:
                 yf_diag["other_err"] += 1
                 diag_err(diag, e, "FILTER_RANK_ONLY")
         res_df = pd.DataFrame(results)
         if not res_df.empty:
-            res_df = res_df.sort_values(["漲幅%", "爆量"], ascending=[False, False])
+            res_df = res_df.sort_values(["上漲幅度%", "交易熱度"], ascending=[False, False])
         return res_df, stats, yf_diag
 
     t_yf_start = time.perf_counter()
@@ -904,31 +904,31 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
                 else:
                     break
             if use_bloodline and (not is_test) and past_boards < 1:
-                stats["非連板標的"].append(f"{c} {name}")
+                stats["過去沒有連續大漲紀錄"].append(f"{c} {name}")
                 continue
             vol_ratio = r["vol_sh"] / (vol_ma20_sh * frac + 1e-9)
             if vol_ratio < (0.5 if is_test else 1.3):
-                stats["爆量不足"].append(f"{c} {name}")
+                stats["交易熱度不夠"].append(f"{c} {name}")
                 continue
             rng = max(0.0, r["high"] - r["low"])
             if (r["high"] - r["last"]) / max(1e-9, r["high"]) > pb_lim:
-                stats["回落過大"].append(f"{c} {name}")
+                stats["從高點跌落太多"].append(f"{c} {name}")
                 continue
             if rng > 0.1 and (r["last"] - r["low"]) / max(1e-9, rng) < (0.5 if is_test else 0.80):
-                stats["收盤太弱"].append(f"{c} {name}")
+                stats["最後沒力氣維持高價"].append(f"{c} {name}")
                 continue
             near_limit = abs(r["last"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
             high_is_limit = abs(r["high"] - r["upper"]) <= max(tw_tick(r["upper"]), r["upper"] * 0.0005)
-            status = "🔥 鎖價跡象" if near_limit and high_is_limit and abs(r["last"] - r["high"]) <= max(tw_tick(r["last"]), r["last"] * 0.0005) else ("🚀 漲停附近" if near_limit else "⚡ 發動")
+            status = "🔥 漲到頂點 (難買到)" if near_limit and high_is_limit and abs(r["last"] - r["high"]) <= max(tw_tick(r["last"]), r["last"] * 0.0005) else ("🚀 快要漲到最高限額了" if near_limit else "⚡ 開始衝刺")
             results.append({
                 "代號": c,
                 "名稱": name,
-                "現價": r["last"],
-                "爆量": vol_ratio,
+                "目前價格": r["last"],
+                "交易熱度": vol_ratio,
                 "狀態": status,
-                "階段": f"連續 {past_boards + 1} 板",
+                "階段": f"連續 {past_boards + 1} 天大漲",
                 "board_val": past_boards,
-                "漲幅%": r["chg_pct"],
+                "上漲幅度%": r["chg_pct"],
             })
         except Exception as e:
             yf_diag["other_err"] += 1
@@ -936,7 +936,7 @@ def core_filter_engine(candidates_df, meta_dict, now_ts, is_test, diag, use_bloo
 
     res_df = pd.DataFrame(results)
     if not res_df.empty:
-        res_df = res_df.sort_values(["board_val", "爆量", "漲幅%"], ascending=[False, False, False])
+        res_df = res_df.sort_values(["board_val", "交易熱度", "上漲幅度%"], ascending=[False, False, False])
     return res_df, stats, yf_diag
 
 
@@ -1083,17 +1083,17 @@ def format_rank_table_html(table_df: pd.DataFrame) -> str:
     def fmt_value(col, val):
         if pd.isna(val):
             return "—"
-        if col == "現價":
+        if col == "目前價格":
             try:
                 return f"{float(val):.2f}".rstrip("0").rstrip(".")
             except Exception:
                 return html.escape(str(val))
-        if col == "爆量":
+        if col == "交易熱度":
             try:
                 return f"{float(val):.2f}x"
             except Exception:
                 return html.escape(str(val))
-        if col == "漲幅%":
+        if col == "上漲幅度%":
             try:
                 return f"{float(val):.2f}%"
             except Exception:
@@ -1108,21 +1108,21 @@ def format_rank_table_html(table_df: pd.DataFrame) -> str:
             return f'<td class="c-code">{safe}</td>'
         if col == "名稱":
             return f'<td class="c-name">{safe}</td>'
-        if col == "現價":
+        if col == "目前價格":
             return f'<td class="c-price">{safe}</td>'
-        if col == "爆量":
+        if col == "交易熱度":
             return f'<td class="c-power">{safe}</td>'
         if col == "狀態":
             cls = "is-live"
             txt = str(val)
-            if "鎖價" in txt or "鎖單" in txt:
+            if "頂點" in txt or "難買" in txt or "鎖價" in txt:
                 cls = "is-lock"
             elif "觀察" in txt or "盤整" in txt:
                 cls = "is-watch"
             return f'<td><span class="status-pill {cls}">{html.escape(txt)}</span></td>'
         if col == "階段":
             return f'<td><span class="stage-pill">{safe}</span></td>'
-        if col == "漲幅%":
+        if col == "上漲幅度%":
             try:
                 num = float(val)
             except Exception:
@@ -1142,8 +1142,8 @@ def format_rank_table_html(table_df: pd.DataFrame) -> str:
         '<div class="rank-table-shell">'
         '<div class="rank-table-toolbar">'
         '<div>'
-        '<div class="rank-table-title">戰區嚴選名單</div>'
-        '<div class="rank-table-subtitle">深色玻璃表格版｜保留閱讀性與掃描速度</div>'
+        '<div class="rank-table-title">嚴選強勢股名單</div>'
+        '<div class="rank-table-subtitle">簡單明瞭｜快速掃描市場焦點</div>'
         '</div>'
         f'<div class="rank-table-count">共 {len(df)} 檔</div>'
         '</div>'
@@ -1158,14 +1158,14 @@ def format_rank_table_html(table_df: pd.DataFrame) -> str:
 
 def _score_badge(score: int) -> str:
     if score >= 9:
-        return "S級戰神"
+        return "S級 (極度強勢)"
     if score >= 8:
-        return "A級強攻"
+        return "A級 (強烈表現)"
     if score >= 7:
-        return "B級觀察"
+        return "B級 (值得觀察)"
     if score >= 5:
-        return "C級偏震盪"
-    return "D級弱勢"
+        return "C級 (表現普通)"
+    return "D級 (目前弱勢)"
 
 
 def _resolve_search_row(query: str, snapshot: dict):
@@ -1202,12 +1202,12 @@ def _resolve_search_row(query: str, snapshot: dict):
             target["stale_note"] = stale_note
         return target, matches
 
-    row, matches = _match_df(raw_df, "本輪快照")
+    row, matches = _match_df(raw_df, "最新資料快取")
     if row is not None:
         return row, matches
 
     backup_asof = snapshot.get("search_backup_asof", "")
-    stale_note = f"官方前一日快照 {backup_asof}" if backup_asof else "官方前一日快照"
+    stale_note = f"官方前一日資料 {backup_asof}" if backup_asof else "官方前一日資料"
     row, matches = _match_df(backup_df, stale_note, stale_note)
     if row is not None:
         return row, matches
@@ -1234,7 +1234,7 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     if (not math.isfinite(prev_close)) or prev_close <= 0:
         prev_close = round(last - chg, 2)
     if last <= 0 or prev_close <= 0:
-        return {"status": "error", "message": "個股快照欄位不足，無法評分。"}
+        return {"status": "error", "message": "這檔股票目前沒有足夠資料可以評估。"}
 
     upper = calc_limit_up(prev_close, 0.10)
     dist_pct = max(0.0, ((upper - last) / upper) * 100)
@@ -1248,16 +1248,16 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     strengths, warnings, filter_flags = [], [], []
 
     if dist_pct <= 1.0:
-        score += 1.8; strengths.append("距漲停極近")
+        score += 1.8; strengths.append("距離今天最高限額非常近")
     elif dist_pct <= 2.0:
-        score += 1.2; strengths.append("接近漲停")
+        score += 1.2; strengths.append("接近今天最高限額")
     elif dist_pct <= 4.0:
         score += 0.6
     else:
-        score -= 0.8; warnings.append("離漲停仍有距離")
+        score -= 0.8; warnings.append("離最高限額還有一段距離")
 
     if chg_pct >= 9.0:
-        score += 1.6; strengths.append("漲幅接近漲停")
+        score += 1.6; strengths.append("漲幅接近單日極限")
     elif chg_pct >= 7.0:
         score += 1.2
     elif chg_pct >= 5.0:
@@ -1265,27 +1265,27 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     elif chg_pct >= 3.0:
         score += 0.4
     elif chg_pct < 0:
-        score -= 1.2; warnings.append("當前漲幅為負")
+        score -= 1.2; warnings.append("目前價格比昨天還低")
 
     if range_pos >= 0.82:
-        score += 1.0; strengths.append("收盤位置貼近高點")
+        score += 1.0; strengths.append("價格穩在今天相對高點")
     elif range_pos >= 0.65:
         score += 0.5
     elif range_pos < (0.5 if is_test else 0.80) and rng > 0.1:
-        score -= 1.1; warnings.append("收盤位置偏低")
-        filter_flags.append("收盤太弱")
+        score -= 1.1; warnings.append("目前價格掉回今天較低的位置")
+        filter_flags.append("最後沒力氣維持高價")
 
     pb_lim = 5.0 if is_test else (1.5 if now_ts.time() <= dtime(10, 30) else 0.9)
     if pullback_pct <= pb_lim * 0.45:
-        score += 0.6; strengths.append("回落控制良好")
+        score += 0.6; strengths.append("高點掉下來的幅度很小")
     elif pullback_pct > pb_lim:
-        score -= 1.0; warnings.append("從高點回落偏大")
-        filter_flags.append("回落過大")
+        score -= 1.0; warnings.append("從今天最高點跌落太多")
+        filter_flags.append("從高點跌落太多")
 
     board_count = 0
     vol_ratio = math.nan
     vol_note = ""
-    yf_status = "降級"
+    yf_status = "放寬標準計算"
 
     if HAS_YF and code in meta_dict:
         sym = f"{code}.{'TW' if market == 'tse' else 'TWO'}"
@@ -1304,57 +1304,57 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
                             m = max(0, min(270, m))
                             frac = 0.5 if is_test else (0.12 if m <= 30 else 0.12 + (0.5 - 0.12) * ((m - 30) / 90.0) if m <= 120 else min(1.0, 0.5 + (1.0 - 0.5) * ((m - 120) / 150.0)))
                             vol_ratio = (vol_lots * 1000.0) / (vol_ma20_sh * frac + 1e-9)
-                            yf_status = "YF量能有效"
-                            vol_note = f"20日均量校正後 {vol_ratio:.2f}x"
+                            yf_status = "有足夠歷史資料對比"
+                            vol_note = f"和過去20天相比，熱度達 {vol_ratio:.2f} 倍"
 
-                        past_10 = past_df.tail(10)
-                        for i in range(len(past_10) - 1, 0, -1):
-                            cp, pp = float(past_10["Close"].iloc[i]), float(past_10["Close"].iloc[i - 1])
-                            lim = infer_daily_limit(pp, cp)
-                            if cp >= (lim - tw_tick(lim)):
-                                board_count += 1
-                            else:
-                                break
+                    past_10 = past_df.tail(10)
+                    for i in range(len(past_10) - 1, 0, -1):
+                        cp, pp = float(past_10["Close"].iloc[i]), float(past_10["Close"].iloc[i - 1])
+                        lim = infer_daily_limit(pp, cp)
+                        if cp >= (lim - tw_tick(lim)):
+                            board_count += 1
+                        else:
+                            break
             except Exception:
                 pass
 
     if not math.isfinite(vol_ratio):
         base_lots = 200.0 if is_test else 2500.0
         vol_ratio = max(0.05, vol_lots / base_lots)
-        vol_note = f"候選基準量能 {vol_ratio:.2f}x"
+        vol_note = f"以固定基準評估熱度 {vol_ratio:.2f} 倍"
 
     if vol_ratio >= 2.5:
-        score += 1.6; strengths.append("量能明顯超標")
+        score += 1.6; strengths.append("交易量異常熱絡")
     elif vol_ratio >= 1.8:
         score += 1.1
     elif vol_ratio >= 1.3:
         score += 0.6
     elif vol_ratio < (0.5 if is_test else 1.3):
-        score -= 1.2; warnings.append("量能不足")
-        filter_flags.append("爆量不足")
+        score -= 1.2; warnings.append("交易熱度不足")
+        filter_flags.append("交易熱度不夠")
 
     if board_count >= 2:
-        score += 0.9; strengths.append("連板血統強")
+        score += 0.9; strengths.append("過去常有連續大漲紀錄")
     elif board_count == 1:
-        score += 0.5; strengths.append("具連板血統")
+        score += 0.5; strengths.append("之前曾經大漲過")
     elif use_bloodline and HAS_YF and (not is_test):
-        score -= 0.8; warnings.append("無連板血統")
-        filter_flags.append("非連板標的")
+        score -= 0.8; warnings.append("近期沒有連續大漲的紀錄")
+        filter_flags.append("過去沒有連續大漲紀錄")
 
     score = int(max(0, min(10, round(score))))
 
     if near_limit and high_is_limit and pullback_pct <= max(0.2, pb_lim * 0.2):
-        action = "通過嚴選，可列入戰區"
-        status = "🔥 鎖價跡象"
+        action = "表現優異，值得緊盯"
+        status = "🔥 漲到頂點 (難買到)"
     elif score >= 8 and len(filter_flags) <= 1:
-        action = "高分觀察，可盯盤"
-        status = "🚀 漲停附近" if near_limit else "⚡ 強勢發動"
+        action = "表現強勁，可持續觀察"
+        status = "🚀 快要漲到最高限額了" if near_limit else "⚡ 強勢發動"
     elif score >= 6:
-        action = "中性觀察，需等確認"
-        status = "👀 觀察"
+        action = "普通，需要再看看"
+        status = "👀 持續觀察"
     else:
-        action = "不建議追價"
-        status = "🧊 偏弱"
+        action = "目前偏弱，不建議買進"
+        status = "🧊 動能偏弱"
 
     return {
         "status": "ok",
@@ -1379,7 +1379,7 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
         "strengths": strengths[:5],
         "warnings": warnings[:5],
         "filter_flags": filter_flags[:5],
-        "query_source": row.get("search_source", "本輪快照"),
+        "query_source": row.get("search_source", "最新資料快取"),
         "stale_note": row.get("stale_note", ""),
         "yf_status": yf_status,
     }
@@ -1420,14 +1420,14 @@ def _parse_single_wantgoo_quote(html: str, code: str, name: str, market: str):
     )
     m = pat.search(text)
     if not m:
-        raise ValueError('WantGoo 單股頁解析失敗')
+        raise ValueError('單獨查詢 WantGoo 解析失敗')
     asof, last, chg, chg_pct, high, low, vol = m.groups()
     last = _to_float(last); chg = _to_float(chg); chg_pct = _to_float(chg_pct)
     high = _to_float(high) or last; low = _to_float(low) or last; vol = _to_float(vol)
     return {
         'code': code, 'name': name, 'last': last, 'chg': chg, 'chg_pct': chg_pct,
         'high': high, 'low': low, 'vol_lots': vol, 'prev_close': (last - chg) if pd.notna(chg) else math.nan,
-        'market': market, 'search_source': '單股補抓 WantGoo', 'stale_note': f'單股補抓 {asof}，非本輪排行池快照'
+        'market': market, 'search_source': '單獨查詢 WantGoo', 'stale_note': f'單獨查詢 {asof} 的狀態'
     }
 
 
@@ -1443,7 +1443,7 @@ def _parse_single_yahoo_quote(html: str, code: str, name: str, market: str):
         pat = re.compile(rf"{re.escape(code)}(?:\.TW|\.TWO)? .*?([0-9]+(?:\.[0-9]+)?)\s*([+\-]?[0-9]+(?:\.[0-9]+)?)\s*\(([+\-]?[0-9]+(?:\.[0-9]+)?)%\)", re.I)
         m = pat.search(text)
     if not m:
-        raise ValueError('Yahoo 單股頁解析失敗')
+        raise ValueError('單獨查詢 Yahoo 解析失敗')
     last, chg, chg_pct = m.groups()
     last = _to_float(last); chg = _to_float(chg); chg_pct = _to_float(chg_pct)
     vol = math.nan
@@ -1458,11 +1458,11 @@ def _parse_single_yahoo_quote(html: str, code: str, name: str, market: str):
     if lm: low = _to_float(lm.group(1)) or last
     tm = re.search(r'(?:開盤|盤中|收盤)\s*\|\s*(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})\s*更新', text)
     asof = tm.group(1) if tm else ''
-    note = f'單股補抓 {asof}，部分欄位可能為降級估值' if asof else '單股補抓，部分欄位可能為降級估值'
+    note = f'單獨查詢 {asof}' if asof else '單獨查詢，部分資料可能略有落差'
     return {
         'code': code, 'name': name, 'last': last, 'chg': chg, 'chg_pct': chg_pct,
         'high': high, 'low': low, 'vol_lots': vol, 'prev_close': (last - chg) if pd.notna(chg) else math.nan,
-        'market': market, 'search_source': '單股補抓 Yahoo', 'stale_note': note
+        'market': market, 'search_source': '單獨查詢 Yahoo', 'stale_note': note
     }
 
 
@@ -1520,7 +1520,7 @@ def recompute_single_search(search_state: dict, scan: dict, is_test: bool, use_b
 # =========================
 # UI / THEME
 # =========================
-st.set_page_config(page_title="起漲戰情室 Ultra", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="股市熱門趨勢雷達 Ultra", page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 st.markdown(
     """
 <style>
@@ -1705,13 +1705,13 @@ st.markdown(
 st.markdown(
     f'''
 <div class="hero-wrap">
-  <div class="title">起漲戰情室 ULTRA</div>
-  <div class="subtitle">v8.7｜官方 API 優先｜HTML 備援｜模式即時切換｜訊號校準 180 日</div>
+  <div class="title">股市熱門趨勢雷達 ULTRA</div>
+  <div class="subtitle">v8.7｜優先使用官方資料｜備用網頁資料｜模式秒切換｜過去 180 天準確度測試</div>
   <div class="hero-badges">
     <span class="badge blue">🏛️ 官方優先</span>
-    <span class="badge green">⚡ 切換不重抓</span>
-    <span class="badge purple">🧪 校準 {CALIBRATION_LOOKBACK_DAYS} 日</span>
-    <span class="badge">🛡️ {'YF 可用' if HAS_YF else '無 YF 降級'}</span>
+    <span class="badge green">⚡ 快速切換不重載</span>
+    <span class="badge purple">🧪 準確度回測 {CALIBRATION_LOOKBACK_DAYS} 天</span>
+    <span class="badge">🛡️ {'歷史進階資料：正常' if HAS_YF else '歷史進階資料：停用'}</span>
   </div>
 </div>
 ''',
@@ -1719,27 +1719,27 @@ st.markdown(
 )
 
 if not HAS_YF:
-    st.warning("⚠️ 目前環境未安裝 yfinance，系統會走『排行即時候選模式』。若要恢復 20 日量均 / 連板血統 / 訊號校準，請在 requirements.txt 加入 yfinance。")
+    st.warning("⚠️ 目前環境尚未安裝進階歷史套件 (yfinance)，系統會使用『基本即時熱度模式』。若要恢復 過去20天平均交易熱度 / 連續大漲紀錄 / 歷史準確度測試，請安裝對應套件。")
 
 cfg1, cfg2, cfg3 = st.columns([1.15, 1.15, 1.7])
 with cfg1:
-    is_test = st.toggle("🔥 寬鬆測試模式", value=False)
+    is_test = st.toggle("🔥 寬鬆測試模式 (放寬篩選標準)", value=False)
 with cfg2:
-    use_bloodline = st.toggle("🛡️ 嚴格連板血統", value=True, disabled=not HAS_YF)
+    use_bloodline = st.toggle("🛡️ 嚴格要求大漲紀錄 (只挑以前大漲過的)", value=True, disabled=not HAS_YF)
 with cfg3:
-    st.markdown('<div class="top-note">切換模式只重算，不重抓。只有重新按掃描，才會重新向資料源取一次快照。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="top-note">切換模式只會重新計算，不會重新下載資料。只有按下下方掃描按鈕，才會去網路抓最新資料。</div>', unsafe_allow_html=True)
 
 now_time = time.time()
 last_run = st.session_state.get("last_run_ts", 0)
 cooldown_seconds = 12
 
-if st.button("🚀 啟動戰區掃描"):
+if st.button("🚀 開始掃描全市場"):
     if now_time - last_run < cooldown_seconds:
-        st.warning(f"⏳ 系統冷卻中，請等待 {int(cooldown_seconds - (now_time - last_run))} 秒後再執行。")
+        st.warning(f"⏳ 系統正在冷卻中，請等待 {int(cooldown_seconds - (now_time - last_run))} 秒後再執行。")
     else:
         st.session_state["last_run_ts"] = now_time
         t0, diag = time.perf_counter(), diag_init()
-        with st.status("⚡ 建立安全連線與解析市場中...", expanded=True) as status:
+        with st.status("⚡ 正在連線並解讀市場狀況...", expanded=True) as status:
             t = time.perf_counter()
             base_meta, meta_errs = get_stock_list()
             diag["t_meta"] = time.perf_counter() - t
@@ -1803,30 +1803,30 @@ if scan and scan.get("snapshot") and (scan.get("is_test") != is_test or scan.get
 scan = st.session_state.get("last_scan")
 if scan:
     d, res, sts, ts = scan["diag"], scan["res"], scan["stats"], scan["ts"]
-    t_str = f"測試: {'ON' if scan['is_test'] else 'OFF'} | 血統: {'ON' if scan['use_bloodline'] else 'OFF'}"
-    asof = f" | 快照：{d.get('rank_asof')}" if d.get("rank_asof") else ""
+    t_str = f"測試模式: {'開啟' if scan['is_test'] else '關閉'} | 嚴格歷史紀錄: {'開啟' if scan['use_bloodline'] else '關閉'}"
+    asof = f" | 快照時間：{d.get('rank_asof')}" if d.get("rank_asof") else ""
     st.markdown(
-        f'<div class="hint" style="text-align:center; margin: 2px 0 18px 0;">上次更新：{ts.strftime("%H:%M:%S")} | {t_str}{asof} | 資料源：{d.get("rank_source", "-")} | 模式：{d.get("source_mode", "-")} | 耗時：{d.get("total", 0):.2f}s</div>',
+        f'<div class="hint" style="text-align:center; margin: 2px 0 18px 0;">上次更新：{ts.strftime("%H:%M:%S")} | {t_str}{asof} | 資料來源：{d.get("rank_source", "-")} | 模式：{d.get("source_mode", "-")} | 處理時間：{d.get("total", 0):.2f} 秒</div>',
         unsafe_allow_html=True,
     )
     if scan.get("instant_switch"):
-        st.caption("⚡ 本次為模式即時切換，直接套用上次快取重算，未重新抓取網站。")
+        st.caption("⚡ 本次為模式即時切換，系統直接套用上次的快取重新運算，沒有花時間重新上網抓資料。")
 
     m1, m2, m3, m4 = st.columns(4)
     total_parse = d.get("rank_parse_ok", 0) + d.get("rank_parse_fail", 0)
-    m1.metric("候選標的", d.get("cand_total", 0))
-    m2.metric("嚴選錄取檔數", len(res))
-    m3.metric("排行解析良率", f"{(d.get('rank_parse_ok', 0) / max(1, total_parse) * 100):.1f}%")
-    m4.metric("系統異常阻擋", d.get("rank_req_err", 0) + d.get("yf_fail", 0) + d.get("other_err", 0))
+    m1.metric("初步篩選檔數", d.get("cand_total", 0))
+    m2.metric("嚴格過關檔數", len(res))
+    m3.metric("資料解讀成功率", f"{(d.get('rank_parse_ok', 0) / max(1, total_parse) * 100):.1f}%")
+    m4.metric("網路異常次數", d.get("rank_req_err", 0) + d.get("yf_fail", 0) + d.get("other_err", 0))
 
     st.markdown('<div class="glass" style="margin-top:16px; margin-bottom:16px;">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">🔎 獨立搜索評分</div>', unsafe_allow_html=True)
-    st.caption("輸入股票代號或名稱，系統會用同一份快照與同一套規則做單檔評分；若盤中只抓到排行池，查不到的股票會明確提示。")
+    st.markdown('<div class="section-title">🔎 單獨查詢與評估</div>', unsafe_allow_html=True)
+    st.caption("只要輸入股票的代號或名稱，系統就會用相同的嚴格標準幫你打分數。")
     s1, s2 = st.columns([2.2, 1])
     with s1:
-        st.text_input("輸入代號 / 名稱", key="single_search_query", placeholder="例如 3017、群創、8299")
+        st.text_input("請輸入代號 / 名稱", key="single_search_query", placeholder="例如：3017 或 鴻海")
     with s2:
-        search_clicked = st.button("🎯 搜索並評分", key="single_search_button")
+        search_clicked = st.button("🎯 開始評估", key="single_search_button")
 
     if search_clicked:
         q = st.session_state.get("single_search_query", "").strip()
@@ -1852,41 +1852,41 @@ if scan:
                     f'<div class="price-large">{sr["last"]:.2f}</div>'
                     f'<div style="margin-top:10px; color:#dce9f8; font-size:16px; font-weight:800;">系統評分 {sr["score"]}/10</div>'
                     f'<div style="margin-top:8px; color:#9cb1c7; font-weight:700;">{sr["live_status"]} ｜ {sr["action"]}</div>'
-                    f'<div style="margin-top:8px; color:#9cb1c7; font-size:13px;">來源：{sr["query_source"]}{(" ｜ " + sr["stale_note"]) if sr.get("stale_note") else ""}</div>'
+                    f'<div style="margin-top:8px; color:#9cb1c7; font-size:13px;">資料來源：{sr["query_source"]}{(" ｜ " + sr["stale_note"]) if sr.get("stale_note") else ""}</div>'
                     '</div>'
                 )
                 st.markdown(card_html, unsafe_allow_html=True)
             with right:
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("漲幅", f'{sr["chg_pct"]:.2f}%')
-                c2.metric("距漲停", f'{sr["dist_pct"]:.2f}%')
-                c3.metric("量能", f'{sr["vol_ratio"]:.2f}x')
-                c4.metric("血統", f'{sr["board_count"]} 板')
+                c1.metric("上漲幅度", f'{sr["chg_pct"]:.2f}%')
+                c2.metric("距今天限額", f'{sr["dist_pct"]:.2f}%')
+                c3.metric("交易熱度", f'{sr["vol_ratio"]:.2f} 倍')
+                c4.metric("歷史紀錄", f'連 {sr["board_count"]} 天大漲')
                 c5, c6, c7 = st.columns(3)
-                c5.metric("回落", f'{sr["pullback_pct"]:.2f}%')
-                c6.metric("收盤位置", f'{sr["range_pos"]:.1f}%')
+                c5.metric("從高點掉下", f'{sr["pullback_pct"]:.2f}%')
+                c6.metric("當天相對高低位置", f'{sr["range_pos"]:.1f}%')
                 c7.metric("資料模式", sr["yf_status"])
-                st.markdown("**加分點**")
+                st.markdown("**加分亮點**")
                 if sr.get("strengths"):
                     st.markdown("<div>" + "".join([f'<span class="badge green">+ {x}</span>' for x in sr["strengths"]]) + "</div>", unsafe_allow_html=True)
                 else:
-                    st.caption("目前沒有明顯加分點。")
-                st.markdown("**風險 / 扣分**")
+                    st.caption("目前沒有明顯加分的表現。")
+                st.markdown("**風險 / 扣分項目**")
                 if sr.get("warnings"):
                     st.markdown("<div>" + "".join([f'<span class="fail-tag">{x}</span>' for x in sr["warnings"]]) + "</div>", unsafe_allow_html=True)
                 else:
-                    st.caption("目前沒有明顯扣分警示。")
+                    st.caption("目前沒有明顯的扣分或危險訊號。")
                 if sr.get("filter_flags"):
-                    st.caption("濾網警示：" + "、".join(sr["filter_flags"]))
+                    st.caption("嚴格把關淘汰原因：" + "、".join(sr["filter_flags"]))
                 st.caption(sr.get("vol_note", ""))
         elif search_report.get("status") == "miss":
-            st.warning("查無可評估資料；本輪排行池與單股補抓都沒有成功拿到可用快照。")
+            st.warning("查無相關資料。目前的清單和備用資料庫裡都沒找到。")
             if search_report.get("matches"):
-                st.caption("你可能想找：" + "｜".join(search_report["matches"]))
+                st.caption("你可能想找的是：" + " ｜ ".join(search_report["matches"]))
             if search_report.get("fetch_errors"):
-                st.caption("單股補抓失敗：" + " | ".join(search_report["fetch_errors"][:3]))
+                st.caption("單獨查詢連線失敗：" + " | ".join(search_report["fetch_errors"][:3]))
         elif search_report.get("status") == "error":
-            st.error(search_report.get("message", "單股評估失敗"))
+            st.error(search_report.get("message", "這檔股票目前無法評估"))
     st.markdown('</div>', unsafe_allow_html=True)
 
     # Calibration panel
@@ -1903,32 +1903,32 @@ if scan:
             cal = calibrate_signal_quality(tuple(cal_symbols), CALIBRATION_LOOKBACK_DAYS)
             d["t_cal"] = time.perf_counter() - t
             st.markdown('<div class="glass" style="margin-top:16px; margin-bottom:16px;">', unsafe_allow_html=True)
-            st.markdown('<div class="section-title">🧪 訊號校準（近 180 日，現有強勢名單樣本）</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">🧪 篩選條件準確度測試（回測近 180 天的歷史表現）</div>', unsafe_allow_html=True)
             if cal.get("status") == "ok":
                 c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("校準分數", f"{cal['score']}/10")
-                c2.metric("樣本訊號數", cal["signal_count"])
-                c3.metric("3日最大均值", f"{cal['avg_max_3d']:.2f}%")
-                c4.metric("3日>3% 勝率", f"{cal['win_3d_gt3']:.1f}%")
-                c5.metric("5日>5% 勝率", f"{cal['win_5d_gt5']:.1f}%")
-                st.caption("這是『現有強勢股樣本』的歷史訊號校準，不是全市場完整事件回測；用途是檢查濾網方向有沒有明顯偏離。")
+                c1.metric("可靠度評分", f"{cal['score']}/10")
+                c2.metric("歷史出現次數", cal["signal_count"])
+                c3.metric("後3天平均最大漲幅", f"{cal['avg_max_3d']:.2f}%")
+                c4.metric("後3天漲過3%的機率", f"{cal['win_3d_gt3']:.1f}%")
+                c5.metric("後5天漲過5%的機率", f"{cal['win_5d_gt5']:.1f}%")
+                st.caption("這是針對『畫面上這些強勢股』在過去 180 天相似情況下的表現統計，主要用來確認我們的篩選邏輯有沒有嚴重失準。")
             else:
-                st.caption(f"校準略過：{cal.get('reason', '-')}")
+                st.caption(f"因為某些原因跳過測試：{cal.get('reason', '-')}")
             st.markdown('</div>', unsafe_allow_html=True)
 
-    with st.expander("⚙️ 系統診斷與底層監控 (白盒分析)", expanded=False):
+    with st.expander("⚙️ 系統運作狀況與工程數據 (適合進階使用者)", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("股票主清單", d.get("meta_count", 0))
-        c2.metric("排行有效解析", d.get("rank_parse_ok", 0))
-        c3.metric("YF 數據覆蓋", "未安裝 / 降級" if not HAS_YF else f"{d.get('yf_returned', 0)} / {d.get('yf_symbols', 0)}")
-        rescue_msg = f"{'🟢 啟動' if d.get('yf_rescue_used', 0) else '⚪ 待命'} | ERR {d.get('other_err', 0)}"
-        c4.metric("救援協議 / 錯誤", rescue_msg)
-        st.caption(f"📡 來源：{d.get('rank_source', '-')} | 模式：{d.get('source_mode', '-')} | 候選池 {d.get('rank_rows', 0)} 檔 | Request ERR {d.get('rank_req_err', 0)}")
-        st.caption(f"耗時：Meta {d.get('t_meta',0):.2f}s | Rank {d.get('t_rank',0):.2f}s | YF {d.get('t_yf',0):.2f}s | Filter {d.get('t_filter',0):.2f}s | Cal {d.get('t_cal',0):.2f}s")
+        c1.metric("市場總檔數", d.get("meta_count", 0))
+        c2.metric("資料成功讀取數", d.get("rank_parse_ok", 0))
+        c3.metric("進階資料庫連線", "未安裝套件" if not HAS_YF else f"{d.get('yf_returned', 0)} / {d.get('yf_symbols', 0)}")
+        rescue_msg = f"{'🟢 啟動' if d.get('yf_rescue_used', 0) else '⚪ 待命'} | 錯誤 {d.get('other_err', 0)}"
+        c4.metric("系統救援 / 錯誤", rescue_msg)
+        st.caption(f"📡 目前來源：{d.get('rank_source', '-')} | 處理模式：{d.get('source_mode', '-')} | 初步候選名單 {d.get('rank_rows', 0)} 檔 | 連線錯誤 {d.get('rank_req_err', 0)} 次")
+        st.caption(f"花費時間：基本資料 {d.get('t_meta',0):.2f} 秒 | 取得排行 {d.get('t_rank',0):.2f} 秒 | 進階資料 {d.get('t_yf',0):.2f} 秒 | 過濾分析 {d.get('t_filter',0):.2f} 秒 | 歷史測試 {d.get('t_cal',0):.2f} 秒")
         if d.get("last_errors"):
             st.code("\n".join(d["last_errors"]))
 
-    with st.expander("🎯 戰損與淘汰名單 (實名點名)", expanded=True):
+    with st.expander("🎯 被淘汰的股票與原因 (看看誰沒過關)", expanded=True):
         for reason, stocks in sts.items():
             if isinstance(stocks, list) and stocks:
                 st.markdown(f"**{reason}**")
@@ -1943,19 +1943,19 @@ if scan:
                     f'''<div class="pro-card">
                         <div class="tag-pro">{r['階段']}</div>
                         <div class="stock-name">{r['代號']} {r['名稱']}</div>
-                        <div class="price-large">{r['現價']:.2f}</div>
+                        <div class="price-large">{r['目前價格']:.2f}</div>
                         <div style="margin-top:12px; color:#9cb1c7; font-weight:700;">{r['狀態']}</div>
-                        <div style="margin-top:8px; color:#d6e6f4; font-size:14px;">動能 {r['爆量']:.1f}x ｜ 漲幅 {r['漲幅%']:.2f}%</div>
+                        <div style="margin-top:8px; color:#d6e6f4; font-size:14px;">交易熱度 {r['交易熱度']:.1f} 倍 ｜ 上漲 {r['上漲幅度%']:.2f}%</div>
                     </div>''',
                     unsafe_allow_html=True,
                 )
-        table_df = res[["代號", "名稱", "現價", "爆量", "狀態", "階段", "漲幅%"]].copy()
-        with st.expander("📋 嚴選名單明細表", expanded=False):
+        table_df = res[["代號", "名稱", "目前價格", "交易熱度", "狀態", "階段", "上漲幅度%"]].copy()
+        with st.expander("📋 嚴格過關名單總表", expanded=False):
             st.markdown(format_rank_table_html(table_df), unsafe_allow_html=True)
     else:
         if d.get("rank_parse_ok", 0) == 0:
-            st.error("🚨 本輪未成功取得可用排行快照。請先看白盒面板，確認官方或備援來源是否都失敗。")
+            st.error("🚨 這次沒有成功抓到資料哦。可以打開「系統運作狀況」檢查一下是不是網站連線出了問題。")
         else:
-            st.warning("⚠️ 掃描完畢，目前沒有標的通過你設定的濾網。")
+            st.warning("⚠️ 掃描完畢，但在目前嚴格的條件下，市場上沒有找到符合標準的股票。")
 else:
-    st.info("先按『啟動戰區掃描』。這版會先試官方 API，再視盤中情況切 HTML 備援。")
+    st.info("請先點擊上方『開始掃描全市場』按鈕。系統會先找最準確的官方資料，如果盤中拿不到，會自動切換成備用網頁資料。")

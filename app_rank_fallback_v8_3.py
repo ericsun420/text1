@@ -304,11 +304,11 @@ def _normalize_official_rows(rows: List[dict], market: str, asof: str = "") -> p
     for row in rows or []:
         code = _normalize_code(_first_value(row, ["Code", "股票代號", "SecuritiesCompanyCode", "證券代號", "證券代碼"]))
         name = _clean_name(_first_value(row, ["Name", "股票名稱", "CompanyName", "證券名稱"]))
-        last = _to_float(_first_value(row, ["ClosingPrice", "收盤價", "Close", "收盤"] ))
+        last = _to_float(_first_value(row, ["ClosingPrice", "收盤價", "Close", "收盤"]))
         high = _to_float(_first_value(row, ["HighestPrice", "最高價", "High", "最高"]))
         low = _to_float(_first_value(row, ["LowestPrice", "最低價", "Low", "最低"]))
         open_p = _to_float(_first_value(row, ["OpeningPrice", "開盤價", "Open", "開盤"]))
-        change = _to_float(_first_value(row, ["Change", "漲跌價差", "漲跌", "漲跌價"] ))
+        change = _to_float(_first_value(row, ["Change", "漲跌價差", "漲跌", "漲跌價"]))
         dir_sign = str(_first_value(row, ["Dir", "漲跌(+/-)", "漲跌註記", "UpDown", "Direction"], default="")).strip()
         if math.isfinite(change) and dir_sign in ("-", "▽", "▼"):
             change = -abs(change)
@@ -557,7 +557,6 @@ def _parse_wantgoo_table(html: str):
     name_col = _find_col(df, ["股票"])
     price_col = _find_col(df, ["成交價"])
     change_col = _find_col(df, ["漲跌"])
-    pct_col = _find_col(df, ["漲跌"])
     high_col = _find_col(df, ["最高"])
     low_col = _find_col(df, ["最低"])
     vol_col = _find_col(df, ["成交量"])
@@ -572,8 +571,11 @@ def _parse_wantgoo_table(html: str):
     for c in ["last", "chg", "high", "low", "vol_lots"]:
         out[c] = out[c].apply(_to_float)
     out["prev_close"] = out["last"] - out["chg"]
-    out["chg_pct"] = ((_safe_pct(1, 1)) * 0.0)
-    out["chg_pct"] = out.apply(lambda r: (_safe_pct(r["last"] - r["prev_close"], r["prev_close"]) * 100) if pd.notna(r["prev_close"]) and r["prev_close"] > 0 else math.nan, axis=1)
+    out["chg_pct"] = out.apply(
+        lambda r: (_safe_pct(r["last"] - r["prev_close"], r["prev_close"]) * 100)
+        if pd.notna(r["prev_close"]) and r["prev_close"] > 0 else math.nan,
+        axis=1
+    )
     out["market"] = ""
     out = out.dropna(subset=["code", "last", "high", "low", "vol_lots"])
     out = out[out["last"] > 0].copy()
@@ -665,7 +667,6 @@ def fetch_rank_snapshot(status_placeholder, diag, meta_dict):
     official_backup_df = pd.DataFrame()
     official_backup_asof = ""
 
-    # 盤後/盤前優先用官方收盤快照；盤中先試官方，若日期明顯落後再切 HTML live。
     try:
         status_placeholder.update(label="🏛️ 正在檢查官方資料庫...", state="running")
         official_df, official_asof, official_name, official_errors = fetch_official_combined_snapshot(None)
@@ -951,6 +952,276 @@ def _future_max_return(series_high: pd.Series, series_close: pd.Series, horizon:
     return max_future / series_close - 1.0
 
 
+# =========================
+# CONTINUATION FORECAST / 白話續漲預測
+# =========================
+def simple_rule_based_forecast(chg_pct, vol_ratio, board_count, dist_pct, range_pos, pullback_pct, note="這是簡易推估，因為歷史資料不足"):
+    points = 0
+
+    if chg_pct >= 8:
+        points += 2
+    elif chg_pct >= 5:
+        points += 1
+
+    if vol_ratio >= 2.3:
+        points += 2
+    elif vol_ratio >= 1.4:
+        points += 1
+
+    if board_count >= 1:
+        points += 1
+
+    if dist_pct <= 1.5:
+        points += 1
+
+    if range_pos >= 0.80:
+        points += 1
+
+    if pullback_pct > 1.5:
+        points -= 1
+
+    if points >= 6:
+        days_text, prob = "1~2天", 60.0
+    elif points >= 4:
+        days_text, prob = "0~1天", 50.0
+    else:
+        days_text, prob = "今天強，但延續力先保守看", 38.0
+
+    return {
+        "days_text": days_text,
+        "prob": round(prob, 1),
+        "confidence": "低",
+        "sample_count": 0,
+        "note": note,
+    }
+
+
+@st.cache_data(ttl=YF_CACHE_TTL, show_spinner=False)
+def batch_estimate_continuation_forecast(
+    symbols: Tuple[str, ...],
+    feature_rows: Tuple[Tuple, ...],
+    lookback_days: int = CALIBRATION_LOOKBACK_DAYS,
+):
+    feature_map = {
+        row[0]: {
+            "dist_pct": float(row[1]),
+            "range_pos": float(row[2]),
+            "pullback_pct": float(row[3]),
+            "chg_pct": float(row[4]),
+            "vol_ratio": float(row[5]),
+            "board_count": int(row[6]),
+        }
+        for row in feature_rows
+    }
+
+    results = {}
+    if not symbols:
+        return results
+
+    raw = yf_download_daily(tuple(dict.fromkeys(symbols)), f"{max(lookback_days + 80, 260)}d") if HAS_YF else None
+
+    if raw is None or getattr(raw, "empty", False):
+        for sym in symbols:
+            feat = feature_map.get(sym, {})
+            results[sym] = simple_rule_based_forecast(
+                feat.get("chg_pct", 0.0),
+                feat.get("vol_ratio", 1.0),
+                feat.get("board_count", 0),
+                feat.get("dist_pct", 9.9),
+                feat.get("range_pos", 0.5),
+                feat.get("pullback_pct", 9.9),
+            )
+        return results
+
+    for sym in symbols:
+        feat = feature_map.get(sym, {})
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                if sym not in raw.columns.get_level_values(0):
+                    raise KeyError(sym)
+                df = raw[sym].copy()
+            else:
+                df = raw.copy()
+
+            need_cols = {"High", "Low", "Close", "Volume"}
+            if not need_cols.issubset(df.columns):
+                raise ValueError("missing columns")
+
+            df = df[["High", "Low", "Close", "Volume"]].dropna().copy()
+            if len(df) < 60:
+                raise ValueError("not enough data")
+
+            df = df.tail(max(lookback_days + 25, 120)).copy()
+            df["prev_close"] = df["Close"].shift(1)
+            df["vol_ma20"] = df["Volume"].rolling(20).mean()
+            df["range"] = (df["High"] - df["Low"]).clip(lower=0)
+            df["range_pos"] = ((df["Close"] - df["Low"]) / df["range"].replace(0, math.nan)).clip(lower=0, upper=1)
+            df["upper"] = df["prev_close"].apply(lambda x: calc_limit_up(float(x), 0.10) if pd.notna(x) and x > 0 else math.nan)
+            df["dist_pct"] = (((df["upper"] - df["Close"]) / df["upper"]).clip(lower=0)) * 100
+            df["pullback_pct"] = ((df["High"] - df["Close"]) / df["High"].replace(0, math.nan)) * 100
+            df["chg_pct"] = ((df["Close"] - df["prev_close"]) / df["prev_close"].replace(0, math.nan)) * 100
+            df["vol_ratio"] = df["Volume"] / df["vol_ma20"].replace(0, math.nan)
+
+            df["ret_1d"] = df["Close"].shift(-1) / df["Close"] - 1.0
+            df["max_3d"] = _future_max_return(df["High"], df["Close"], 3)
+            df["max_5d"] = _future_max_return(df["High"], df["Close"], 5)
+
+            df = df.dropna(
+                subset=[
+                    "prev_close", "vol_ma20", "range_pos", "dist_pct",
+                    "pullback_pct", "chg_pct", "vol_ratio",
+                    "ret_1d", "max_3d", "max_5d"
+                ]
+            )
+
+            if df.empty:
+                raise ValueError("no usable rows")
+
+            cur_dist = float(feat.get("dist_pct", 9.9))
+            cur_range = float(feat.get("range_pos", 0.5))
+            cur_pull = float(feat.get("pullback_pct", 9.9))
+            cur_chg = float(feat.get("chg_pct", 0.0))
+            cur_vol = float(feat.get("vol_ratio", 1.0))
+
+            dist_lim = max(2.2, min(6.0, cur_dist + 0.8))
+            range_floor = max(0.60, min(0.95, cur_range - 0.12))
+            pull_lim = max(1.8, min(5.0, cur_pull + 0.8))
+            chg_low = max(2.5, cur_chg - 2.5)
+            chg_high = min(10.5, cur_chg + 1.2)
+            vol_floor = max(1.15, min(3.5, cur_vol * 0.65))
+
+            hits = df[
+                df["dist_pct"].le(dist_lim)
+                & df["range_pos"].ge(range_floor)
+                & df["pullback_pct"].le(pull_lim)
+                & df["chg_pct"].between(chg_low, chg_high, inclusive="both")
+                & df["vol_ratio"].ge(vol_floor)
+            ].copy()
+
+            sample_count = len(hits)
+
+            if sample_count < 5:
+                results[sym] = simple_rule_based_forecast(
+                    cur_chg,
+                    cur_vol,
+                    feat.get("board_count", 0),
+                    cur_dist,
+                    cur_range,
+                    cur_pull,
+                    f"這檔股票以前太少出現相似走法（只抓到 {sample_count} 次），先用簡易推估。"
+                )
+                results[sym]["sample_count"] = sample_count
+                continue
+
+            p1 = float((hits["ret_1d"] > 0).mean() * 100)
+            p3 = float((hits["max_3d"] >= 0.03).mean() * 100)
+            p5 = float((hits["max_5d"] >= 0.05).mean() * 100)
+            avg3 = float(hits["max_3d"].mean() * 100)
+            avg5 = float(hits["max_5d"].mean() * 100)
+
+            if p5 >= 55 and avg5 >= 5.0:
+                days_text, prob, brief = "2~4天", p5, "5天內再衝一段的機會不低"
+            elif p3 >= 58 and avg3 >= 3.0:
+                days_text, prob, brief = "1~3天", p3, "3天內還有再往上的機會"
+            elif p1 >= 55:
+                days_text, prob, brief = "1~2天", p1, "明天續強的機會還不錯"
+            else:
+                days_text, prob, brief = "0~1天", max(35.0, p1), "延續力普通，先不要看太多天"
+
+            conf = "高" if sample_count >= 15 else "中" if sample_count >= 8 else "低"
+
+            results[sym] = {
+                "days_text": days_text,
+                "prob": round(prob, 1),
+                "confidence": conf,
+                "sample_count": sample_count,
+                "note": f"看這檔以前相似的走法，{brief}。目前抓到 {sample_count} 次相似情況。",
+            }
+
+        except Exception:
+            results[sym] = simple_rule_based_forecast(
+                feat.get("chg_pct", 0.0),
+                feat.get("vol_ratio", 1.0),
+                feat.get("board_count", 0),
+                feat.get("dist_pct", 9.9),
+                feat.get("range_pos", 0.5),
+                feat.get("pullback_pct", 9.9),
+            )
+
+    return results
+
+
+def attach_continuation_forecast(res_df: pd.DataFrame, candidates_df: pd.DataFrame, meta_dict: Dict[str, dict]) -> pd.DataFrame:
+    if res_df is None or res_df.empty:
+        return res_df
+
+    work = res_df.copy()
+    cand = candidates_df[["code", "last", "high", "low", "dist", "chg_pct"]].copy()
+    cand = cand.rename(columns={"code": "代號"})
+    work = work.merge(cand, on="代號", how="left")
+
+    symbols = []
+    feature_rows = []
+
+    for _, r in work.iterrows():
+        code = str(r["代號"]).strip()
+        if code not in meta_dict:
+            continue
+
+        ex = meta_dict[code]["ex"]
+        sym = f"{code}.{'TW' if ex == 'tse' else 'TWO'}"
+
+        last = float(r.get("last", math.nan))
+        high = float(r.get("high", math.nan))
+        low = float(r.get("low", math.nan))
+
+        rng = max(0.0, high - low) if math.isfinite(high) and math.isfinite(low) else 0.0
+        range_pos = 1.0 if rng <= 0 else (last - low) / max(rng, 1e-9)
+        pullback_pct = ((high - last) / high) * 100 if math.isfinite(high) and high > 0 else 0.0
+        dist_pct = float(r.get("dist", math.nan)) if pd.notna(r.get("dist", math.nan)) else 9.9
+        chg_pct = float(r.get("chg_pct", 0.0)) if pd.notna(r.get("chg_pct", 0.0)) else 0.0
+        vol_ratio = float(r.get("交易熱度", 1.0)) if pd.notna(r.get("交易熱度", 1.0)) else 1.0
+        board_count = int(r.get("board_val", 0)) if pd.notna(r.get("board_val", 0)) else 0
+
+        symbols.append(sym)
+        feature_rows.append((
+            sym,
+            round(dist_pct, 3),
+            round(range_pos, 4),
+            round(pullback_pct, 3),
+            round(chg_pct, 3),
+            round(vol_ratio, 3),
+            board_count,
+        ))
+
+    forecast_map = batch_estimate_continuation_forecast(
+        tuple(symbols),
+        tuple(feature_rows),
+        CALIBRATION_LOOKBACK_DAYS,
+    ) if symbols else {}
+
+    days_list, prob_list, note_list = [], [], []
+
+    for _, r in work.iterrows():
+        code = str(r["代號"]).strip()
+        if code in meta_dict:
+            ex = meta_dict[code]["ex"]
+            sym = f"{code}.{'TW' if ex == 'tse' else 'TWO'}"
+            fc = forecast_map.get(sym, {})
+        else:
+            fc = {}
+
+        days_list.append(fc.get("days_text", "樣本不足"))
+        prob_list.append(fc.get("prob", math.nan))
+        note_list.append(fc.get("note", ""))
+
+    work["預測還會漲"] = days_list
+    work["續漲機率"] = prob_list
+    work["續漲說明"] = note_list
+
+    return work.drop(columns=["last", "high", "low", "dist", "chg_pct"], errors="ignore")
+
+
 @st.cache_data(ttl=YF_CACHE_TTL, show_spinner=False)
 def calibrate_signal_quality(symbols: Tuple[str, ...], lookback_days: int = CALIBRATION_LOOKBACK_DAYS):
     if (not HAS_YF) or (not symbols):
@@ -1053,6 +1324,7 @@ def recompute_from_snapshot(snapshot, is_test, use_bloodline):
     pre_df = build_rank_candidates(snapshot["raw_rank_df"], snapshot["meta"], now_ts, is_test, diag)
     t = time.perf_counter()
     final_res, stats, yf_diag = core_filter_engine(pre_df, snapshot["meta"], now_ts, is_test, diag, use_bloodline)
+    final_res = attach_continuation_forecast(final_res, pre_df, snapshot["meta"])
     diag["t_filter"] = time.perf_counter() - t
     diag.update(yf_diag)
     diag["total"] = time.perf_counter() - t0
@@ -1071,8 +1343,6 @@ def recompute_from_snapshot(snapshot, is_test, use_bloodline):
 # =========================
 # SINGLE SEARCH / SCORING
 # =========================
-
-
 def format_rank_table_html(table_df: pd.DataFrame) -> str:
     if table_df is None or getattr(table_df, "empty", False):
         return '<div class="rank-table-empty">目前沒有可顯示的資料。</div>'
@@ -1096,6 +1366,11 @@ def format_rank_table_html(table_df: pd.DataFrame) -> str:
         if col == "上漲幅度%":
             try:
                 return f"{float(val):.2f}%"
+            except Exception:
+                return html.escape(str(val))
+        if col == "續漲機率":
+            try:
+                return f"{float(val):.1f}%"
             except Exception:
                 return html.escape(str(val))
         return html.escape(str(val))
@@ -1155,6 +1430,7 @@ def format_rank_table_html(table_df: pd.DataFrame) -> str:
         '</div>'
         '</div>'
     )
+
 
 def _score_badge(score: int) -> str:
     if score >= 9:
@@ -1248,16 +1524,20 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     strengths, warnings, filter_flags = [], [], []
 
     if dist_pct <= 1.0:
-        score += 1.8; strengths.append("距離今天最高限額非常近")
+        score += 1.8
+        strengths.append("距離今天最高限額非常近")
     elif dist_pct <= 2.0:
-        score += 1.2; strengths.append("接近今天最高限額")
+        score += 1.2
+        strengths.append("接近今天最高限額")
     elif dist_pct <= 4.0:
         score += 0.6
     else:
-        score -= 0.8; warnings.append("離最高限額還有一段距離")
+        score -= 0.8
+        warnings.append("離最高限額還有一段距離")
 
     if chg_pct >= 9.0:
-        score += 1.6; strengths.append("漲幅接近單日極限")
+        score += 1.6
+        strengths.append("漲幅接近單日極限")
     elif chg_pct >= 7.0:
         score += 1.2
     elif chg_pct >= 5.0:
@@ -1265,21 +1545,26 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     elif chg_pct >= 3.0:
         score += 0.4
     elif chg_pct < 0:
-        score -= 1.2; warnings.append("目前價格比昨天還低")
+        score -= 1.2
+        warnings.append("目前價格比昨天還低")
 
     if range_pos >= 0.82:
-        score += 1.0; strengths.append("價格穩在今天相對高點")
+        score += 1.0
+        strengths.append("價格穩在今天相對高點")
     elif range_pos >= 0.65:
         score += 0.5
     elif range_pos < (0.5 if is_test else 0.80) and rng > 0.1:
-        score -= 1.1; warnings.append("目前價格掉回今天較低的位置")
+        score -= 1.1
+        warnings.append("目前價格掉回今天較低的位置")
         filter_flags.append("最後沒力氣維持高價")
 
     pb_lim = 5.0 if is_test else (1.5 if now_ts.time() <= dtime(10, 30) else 0.9)
     if pullback_pct <= pb_lim * 0.45:
-        score += 0.6; strengths.append("高點掉下來的幅度很小")
+        score += 0.6
+        strengths.append("高點掉下來的幅度很小")
     elif pullback_pct > pb_lim:
-        score -= 1.0; warnings.append("從今天最高點跌落太多")
+        score -= 1.0
+        warnings.append("從今天最高點跌落太多")
         filter_flags.append("從高點跌落太多")
 
     board_count = 0
@@ -1324,21 +1609,26 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
         vol_note = f"以固定基準評估熱度 {vol_ratio:.2f} 倍"
 
     if vol_ratio >= 2.5:
-        score += 1.6; strengths.append("交易量異常熱絡")
+        score += 1.6
+        strengths.append("交易量異常熱絡")
     elif vol_ratio >= 1.8:
         score += 1.1
     elif vol_ratio >= 1.3:
         score += 0.6
     elif vol_ratio < (0.5 if is_test else 1.3):
-        score -= 1.2; warnings.append("交易熱度不足")
+        score -= 1.2
+        warnings.append("交易熱度不足")
         filter_flags.append("交易熱度不夠")
 
     if board_count >= 2:
-        score += 0.9; strengths.append("過去常有連續大漲紀錄")
+        score += 0.9
+        strengths.append("過去常有連續大漲紀錄")
     elif board_count == 1:
-        score += 0.5; strengths.append("之前曾經大漲過")
+        score += 0.5
+        strengths.append("之前曾經大漲過")
     elif use_bloodline and HAS_YF and (not is_test):
-        score -= 0.8; warnings.append("近期沒有連續大漲的紀錄")
+        score -= 0.8
+        warnings.append("近期沒有連續大漲的紀錄")
         filter_flags.append("過去沒有連續大漲紀錄")
 
     score = int(max(0, min(10, round(score))))
@@ -1355,6 +1645,27 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
     else:
         action = "目前偏弱，不建議買進"
         status = "🧊 動能偏弱"
+
+    forecast = simple_rule_based_forecast(
+        chg_pct, vol_ratio, board_count, dist_pct, range_pos, pullback_pct
+    )
+
+    if code in meta_dict:
+        sym = f"{code}.{'TW' if market == 'tse' else 'TWO'}"
+        forecast_map = batch_estimate_continuation_forecast(
+            (sym,),
+            ((
+                sym,
+                round(dist_pct, 3),
+                round(range_pos, 4),
+                round(pullback_pct, 3),
+                round(chg_pct, 3),
+                round(vol_ratio, 3),
+                int(board_count),
+            ),),
+            CALIBRATION_LOOKBACK_DAYS,
+        )
+        forecast = forecast_map.get(sym, forecast)
 
     return {
         "status": "ok",
@@ -1382,9 +1693,12 @@ def evaluate_single_stock(row: dict, meta_dict: dict, now_ts: datetime, is_test:
         "query_source": row.get("search_source", "最新資料快取"),
         "stale_note": row.get("stale_note", ""),
         "yf_status": yf_status,
+        "forecast_days": forecast.get("days_text", "樣本不足"),
+        "forecast_prob": forecast.get("prob", math.nan),
+        "forecast_note": forecast.get("note", ""),
+        "forecast_confidence": forecast.get("confidence", "低"),
+        "forecast_samples": forecast.get("sample_count", 0),
     }
-
-
 
 
 @st.cache_data(ttl=RANK_CACHE_TTL, show_spinner=False)
@@ -1422,8 +1736,12 @@ def _parse_single_wantgoo_quote(html: str, code: str, name: str, market: str):
     if not m:
         raise ValueError('單獨查詢 WantGoo 解析失敗')
     asof, last, chg, chg_pct, high, low, vol = m.groups()
-    last = _to_float(last); chg = _to_float(chg); chg_pct = _to_float(chg_pct)
-    high = _to_float(high) or last; low = _to_float(low) or last; vol = _to_float(vol)
+    last = _to_float(last)
+    chg = _to_float(chg)
+    chg_pct = _to_float(chg_pct)
+    high = _to_float(high) or last
+    low = _to_float(low) or last
+    vol = _to_float(vol)
     return {
         'code': code, 'name': name, 'last': last, 'chg': chg, 'chg_pct': chg_pct,
         'high': high, 'low': low, 'vol_lots': vol, 'prev_close': (last - chg) if pd.notna(chg) else math.nan,
@@ -1439,23 +1757,28 @@ def _parse_single_yahoo_quote(html: str, code: str, name: str, market: str):
     )
     m = pat.search(text)
     if not m:
-        # 退一步，只抓代碼附近第一組 價/漲跌/漲跌幅
         pat = re.compile(rf"{re.escape(code)}(?:\.TW|\.TWO)? .*?([0-9]+(?:\.[0-9]+)?)\s*([+\-]?[0-9]+(?:\.[0-9]+)?)\s*\(([+\-]?[0-9]+(?:\.[0-9]+)?)%\)", re.I)
         m = pat.search(text)
     if not m:
         raise ValueError('單獨查詢 Yahoo 解析失敗')
     last, chg, chg_pct = m.groups()
-    last = _to_float(last); chg = _to_float(chg); chg_pct = _to_float(chg_pct)
+    last = _to_float(last)
+    chg = _to_float(chg)
+    chg_pct = _to_float(chg_pct)
     vol = math.nan
     for vp in [r'成交量\s*([0-9,]+(?:\.[0-9]+)?)', r'([0-9,]+(?:\.[0-9]+)?)\s*成交量']:
         vm = re.search(vp, text)
         if vm:
-            vol = _to_float(vm.group(1)); break
-    high = last; low = last
+            vol = _to_float(vm.group(1))
+            break
+    high = last
+    low = last
     hm = re.search(r'最高\s*([0-9]+(?:\.[0-9]+)?)', text)
     lm = re.search(r'最低\s*([0-9]+(?:\.[0-9]+)?)', text)
-    if hm: high = _to_float(hm.group(1)) or last
-    if lm: low = _to_float(lm.group(1)) or last
+    if hm:
+        high = _to_float(hm.group(1)) or last
+    if lm:
+        low = _to_float(lm.group(1)) or last
     tm = re.search(r'(?:開盤|盤中|收盤)\s*\|\s*(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})\s*更新', text)
     asof = tm.group(1) if tm else ''
     note = f'單獨查詢 {asof}' if asof else '單獨查詢，部分資料可能略有落差'
@@ -1489,6 +1812,7 @@ def fetch_single_stock_row(query: str, snapshot: dict):
         if errs:
             return None, matches, errs
     return None, matches, []
+
 
 def recompute_single_search(search_state: dict, scan: dict, is_test: bool, use_bloodline: bool):
     query = str(search_state.get("query", "")).strip()
@@ -1758,6 +2082,7 @@ if st.button("🚀 開始掃描全市場"):
             pre_df = build_rank_candidates(raw_rank_df, merged_meta, now_ts, is_test, diag)
             t = time.perf_counter()
             final_res, stats, yf_diag = core_filter_engine(pre_df, merged_meta, now_ts, is_test, diag, use_bloodline)
+            final_res = attach_continuation_forecast(final_res, pre_df, merged_meta)
             diag["t_filter"] = time.perf_counter() - t
             diag.update(yf_diag)
             diag["total"] = time.perf_counter() - t0
@@ -1846,12 +2171,13 @@ if scan:
             left, right = st.columns([1.15, 1.85])
             with left:
                 card_html = (
-                    f'<div class="pro-card" style="min-height:230px;">'
+                    f'<div class="pro-card" style="min-height:250px;">'
                     f'<div class="tag-pro">{sr["badge"]}</div>'
                     f'<div class="stock-name" style="margin-top:10px;">{sr["code"]} {sr["name"]}</div>'
                     f'<div class="price-large">{sr["last"]:.2f}</div>'
                     f'<div style="margin-top:10px; color:#dce9f8; font-size:16px; font-weight:800;">系統評分 {sr["score"]}/10</div>'
                     f'<div style="margin-top:8px; color:#9cb1c7; font-weight:700;">{sr["live_status"]} ｜ {sr["action"]}</div>'
+                    f'<div style="margin-top:8px; color:#97e7ff; font-size:13px; font-weight:800;">預測還會再漲 {sr["forecast_days"]} ｜ 機率 {sr["forecast_prob"]:.1f}%</div>'
                     f'<div style="margin-top:8px; color:#9cb1c7; font-size:13px;">資料來源：{sr["query_source"]}{(" ｜ " + sr["stale_note"]) if sr.get("stale_note") else ""}</div>'
                     '</div>'
                 )
@@ -1862,10 +2188,11 @@ if scan:
                 c2.metric("距今天限額", f'{sr["dist_pct"]:.2f}%')
                 c3.metric("交易熱度", f'{sr["vol_ratio"]:.2f} 倍')
                 c4.metric("歷史紀錄", f'連 {sr["board_count"]} 天大漲')
-                c5, c6, c7 = st.columns(3)
+                c5, c6, c7, c8 = st.columns(4)
                 c5.metric("從高點掉下", f'{sr["pullback_pct"]:.2f}%')
                 c6.metric("當天相對高低位置", f'{sr["range_pos"]:.1f}%')
-                c7.metric("資料模式", sr["yf_status"])
+                c7.metric("預測還會漲", sr["forecast_days"])
+                c8.metric("續漲機率", f'{sr["forecast_prob"]:.1f}%')
                 st.markdown("**加分亮點**")
                 if sr.get("strengths"):
                     st.markdown("<div>" + "".join([f'<span class="badge green">+ {x}</span>' for x in sr["strengths"]]) + "</div>", unsafe_allow_html=True)
@@ -1879,6 +2206,7 @@ if scan:
                 if sr.get("filter_flags"):
                     st.caption("嚴格把關淘汰原因：" + "、".join(sr["filter_flags"]))
                 st.caption(sr.get("vol_note", ""))
+                st.caption(f'{sr.get("forecast_note", "")} ｜ 信心 {sr.get("forecast_confidence", "低")}')
         elif search_report.get("status") == "miss":
             st.warning("查無相關資料。目前的清單和備用資料庫裡都沒找到。")
             if search_report.get("matches"):
@@ -1889,7 +2217,6 @@ if scan:
             st.error(search_report.get("message", "這檔股票目前無法評估"))
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # Calibration panel
     if HAS_YF:
         cal_symbols = []
         if not res.empty:
@@ -1946,10 +2273,11 @@ if scan:
                         <div class="price-large">{r['目前價格']:.2f}</div>
                         <div style="margin-top:12px; color:#9cb1c7; font-weight:700;">{r['狀態']}</div>
                         <div style="margin-top:8px; color:#d6e6f4; font-size:14px;">交易熱度 {r['交易熱度']:.1f} 倍 ｜ 上漲 {r['上漲幅度%']:.2f}%</div>
+                        <div style="margin-top:8px; color:#97e7ff; font-size:13px; font-weight:800;">預測還會再漲 {r['預測還會漲']} ｜ 機率 {r['續漲機率']:.1f}%</div>
                     </div>''',
                     unsafe_allow_html=True,
                 )
-        table_df = res[["代號", "名稱", "目前價格", "交易熱度", "狀態", "階段", "上漲幅度%"]].copy()
+        table_df = res[["代號", "名稱", "目前價格", "交易熱度", "狀態", "階段", "預測還會漲", "續漲機率", "上漲幅度%"]].copy()
         with st.expander("📋 嚴格過關名單總表", expanded=False):
             st.markdown(format_rank_table_html(table_df), unsafe_allow_html=True)
     else:
